@@ -472,18 +472,18 @@ Every paid query distributes:
 ## Production Gaps — Upgrade Roadmap
 
 ### Phase 1: Security Hardening (Must Complete Before Live Payments)
-- [ ] **API Key Authentication**: Every paid endpoint requires `X-API-Key` header. Keys issued via admin dashboard.
-- [ ] **Stripe Webhook Signature Verification**: Every webhook request verified against `STRIPE_WEBHOOK_SECRET`. Reject unsigned requests.
-- [ ] **Input Validation Hardening**: Pydantic models enforce strict type + range constraints. Reject malformed requests at the edge.
+- [x] **API Key Authentication**: ✅ X-API-Key header required on paid endpoints. Keys SHA-256 hashed in `api_keys` table. Admin endpoints: POST/GET/DELETE /admin/keys. Auth: X-Admin-Key header.
+- [x] **Stripe Webhook Signature Verification**: ✅ `stripe.Webhook.construct_event()` enforced. No raw JSON fallback. Rejects all unsigned requests.
+- [x] **Webhook Dead Letter Queue**: ✅ Failed events stored in `webhook_dlq` table. Retry: POST /admin/dlq/retry (X-Admin-Key, max 5 retries). Status: GET /admin/dlq.
+- [ ] **Input Validation Hardening**: Pydantic models enforce strict type + range constraints. Regex validation for agent_id, cpt_code.
 - [ ] **SQL Injection Prevention**: All queries use SQLAlchemy parameterized statements. No raw string interpolation.
 
 ### Phase 2: Reliability (Must Complete Before Production Traffic)
-- [ ] **Redis-Backed Rate Limiting**: Current rate limits are in-memory and reset on restart. Redis ensures limits persist across all instances.
+- [x] **Redis-Backed Rate Limiting**: ✅ Redis client initialized lazily with in-memory DB fallback. Graceful Redis failure handling.
 - [ ] **Database Migrations**: Use Alembic for schema versioning. No manual schema changes.
-- [ ] **Connection Pooling**: PostgreSQL connection pool (PgBouncer or built-in). Current NullPool opens a new connection per request.
+- [ ] **Connection Pooling**: PostgreSQL connection pool (PgBouncer or built-in). Replace NullPool with QueuePool.
 - [ ] **Graceful Shutdown**: uvicorn handles SIGTERM, drains connections, finishes in-flight requests.
-- [ ] **Dead Letter Queue**: Failed Stripe webhook deliveries stored and retried with exponential backoff.
-- [ ] **Health/Ready/Live Probes**: `/health` returns 200 only when DB + Redis connected. `/ready` checks all dependencies.
+- [ ] **Health/Ready/Live Probes**: `/health` returns 200. `/ready` checks DB + Redis connectivity.
 
 ### Phase 3: Observability (Must Complete Before Incident Response)
 - [ ] **Structured Logging**: JSON logs with request_id, agent_id, pattern_id, duration_ms. Every request traceable.
