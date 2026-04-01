@@ -12,13 +12,34 @@ from decimal import Decimal
 from fastapi import FastAPI, HTTPException, Depends, Query, Request, Header, Body
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, desc, func
-from database import get_session, init_db
+from sqlalchemy import and_, desc, func, text
+from database import get_session, init_db, get_engine
 from models import Pattern, PatternOutcome, AgentBalance, Transaction, StripeCustomer, RateLimit, APIKey, WebhookDLQ
 from config import settings
 import json
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="DenialNet™", version="0.1.0")
+app = FastAPI(title="DenialNet™", version="0.2.0")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Graceful startup and shutdown. Drains connections on SIGTERM."""
+    # Startup
+    init_db()
+    print("[STARTUP] DenialNet v0.2.0 initialized")
+    yield
+    # Shutdown: close DB connections gracefully
+    print("[SHUTDOWN] Closing DB connections...")
+    try:
+        engine = get_engine()
+        engine.dispose()
+    except Exception as e:
+        print(f"[SHUTDOWN] Error disposing engine: {e}")
+    print("[SHUTDOWN] Done")
+
+
+app.router.lifespan_context = lifespan
 
 # ── API Key Authentication ────────────────────────────────────────────────────
 
@@ -392,7 +413,53 @@ def admin_dlq_status(
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "DenialNet™", "version": "0.1.0"}
+    """
+    Liveness probe. Returns 200 if the process is alive.
+    Kubernetes uses this to decide whether to restart the container.
+    """
+    return {"status": "ok", "service": "DenialNet™", "version": "0.2.0"}
+
+
+@app.get("/ready")
+def ready(session: Session = Depends(get_session)):
+    """
+    Readiness probe. Returns 200 only when all dependencies are connected.
+    - Database: can execute a test query
+    - Redis: optional, checked if REDIS_URL is configured
+    Returns 503 if any dependency is unavailable.
+    """
+    checks = {}
+    unhealthy = []
+
+    # DB check
+    try:
+        session.execute(text("SELECT 1"))
+        session.commit()
+        checks["db"] = "ok"
+    except Exception as e:
+        checks["db"] = f"error: {e}"
+        unhealthy.append("db")
+
+    # Redis check (optional dependency — Redis is not required)
+    try:
+        rc = _get_redis_client()
+        if rc:
+            rc.ping()
+            checks["redis"] = "ok"
+        else:
+            checks["redis"] = "not_configured"
+    except Exception as e:
+        checks["redis"] = f"error: {e}"
+        unhealthy.append("redis")
+
+    if unhealthy:
+        raise HTTPException(503, {
+            "status": "not_ready",
+            "checks": checks,
+            "unhealthy": unhealthy
+        })
+
+    return {"status": "ready", "checks": checks}
 
 
 @app.get("/")
@@ -1092,7 +1159,3 @@ def get_stats(session: Session = Depends(db)):
 
 
 # ── App startup ──────────────────────────────────────────────────────────────
-
-@app.on_event("startup")
-def startup():
-    init_db()
