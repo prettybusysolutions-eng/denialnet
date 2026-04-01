@@ -1,1 +1,1 @@
-web: gunicorn "app:routes" -b 0.0.0.0:$PORT --workers 2 --threads 4
+web: uvicorn routes:app --host 0.0.0.0 --port $PORT --workers 2
