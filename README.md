@@ -1,121 +1,256 @@
 # DenialNet™ — Federated Claim Intelligence Protocol
 
-**"The intelligence layer every claim system plugs into."**
+> **"Every denied claim is a pattern. Every pattern, a fix. Every fix, revenue."**
 
 ---
 
 ## What It Is
 
-DenialNet™ is a federated denial pattern network. Every successful denial resolution is contributed back to the network and monetized. Agents query patterns, pay contributors, and the network grows smarter with every interaction.
+DenialNet™ is a production-grade **federated intelligence network** for insurance claim denials. It operates as a closed-loop system where contributors submit verified denial resolution patterns, buyers query those patterns to resolve claims, and the network compounds in value with every transaction.
+
+**The pattern graph is the product.** A structured, attributed, outcome-verified map of what actually works to reverse specific denials from specific carriers under specific circumstances.
 
 **Not a billing company. Not a clearinghouse. An intelligence layer.**
 
 ---
 
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                      BUYERS                              │
+│   (AI agents, practice management systems, billers)     │
+└────────────────────────┬────────────────────────────────┘
+                         │ query (75¢) + outcome feedback
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│                  DENIALNET API                           │
+│   FastAPI + PostgreSQL + Stripe + Redis                 │
+│                                                          │
+│   ┌──────────┐  ┌───────────┐  ┌────────────┐          │
+│   │ Search   │  │ Preview   │  │ Contribute │          │
+│   │ Engine   │  │ (free)    │  │ + Attrib.  │          │
+│   └──────────┘  └───────────┘  └────────────┘          │
+│                                                          │
+│   ┌──────────────────────────────────────┐               │
+│   │     PATTERN GRAPH                    │               │
+│   │  (outcome-verified resolutions)      │               │
+│   └──────────────────────────────────────┘               │
+└────────────────────────┬────────────────────────────────┘
+                         │ contributor royalties (70%)
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│                   CONTRIBUTORS                            │
+│   (social workers, nurses, billers, practice admins)     │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Quick Start
 
+### Prerequisites
+- Python 3.11+
+- PostgreSQL 15+ (or SQLite for local dev)
+- Redis 7+ (required for production; optional for dev)
+- Stripe account (test mode by default)
+
+### Local Development
+
 ```bash
+# 1. Clone
 git clone https://github.com/prettybusysolutions-eng/denialnet
 cd denialnet
+
+# 2. Install
 pip install -r requirements.txt
+
+# 3. Configure
+cp .env.example .env
+# Edit .env — set DATABASE_URL, STRIPE_SECRET_KEY, REDIS_URL
+
+# 4. Seed data
 python seed_data.py
-uvicorn routes:app --reload --port 8000
+
+# 5. Run
+uvicorn routes:app --reload --port 8001
 ```
 
-Test:
+### Production Deployment (Render)
+
 ```bash
-curl http://localhost:8000/health
-curl "http://localhost:8000/patterns/preview?carrier=Delta%20Dental&cpt_code=D2740"
-curl -X POST http://localhost:8000/patterns/search \
-  -H "Content-Type: application/json" \
-  -d '{"carrier":"Delta Dental","cpt_code":"D2740","agent_id":"my-agent"}'
+# 1. Create PostgreSQL
+render.com → New → PostgreSQL → name: denialnet-db → Create
+
+# 2. Create Redis
+render.com → New → Redis → name: denialnet-redis → Create
+
+# 3. Connect GitHub repo
+render.com → New → Web Service → connect prettybusysolutions-eng/denialnet
+
+# 4. Set environment variables
+DATABASE_URL=postgresql://...    # from step 1
+REDIS_URL=rediss://...           # from step 2
+STRIPE_SECRET_KEY=sk_live_...    # Stripe live key
+STRIPE_WEBHOOK_SECRET=whsec_...  # from Stripe Dashboard
+DENIALNET_QUERY_COST_CENTS=75
+SECRET_KEY=<generate-32-byte-key>
+
+# 5. Deploy
+# Note the deployed URL, e.g. https://denialnet.onrender.com
+
+# 6. Register Stripe webhook
+# Stripe Dashboard → Developers → Webhooks →
+# Add endpoint: https://denialnet.onrender.com/webhooks/stripe
+# Events: payment_intent.succeeded
 ```
 
 ---
 
-## Deploy to Render
+## Core API Reference
 
-1. **Create PostgreSQL:** render.com → New → PostgreSQL → `denialnet-db`
-2. **Connect repo:** render.com → New → Web Service → connect `prettybusysolutions-eng/denialnet`
-3. **Set env vars:**
-   - `DATABASE_URL` = PostgreSQL connection string
-   - `STRIPE_SECRET_KEY` = `sk_live_...` (optional)
-   - `DENIALNET_QUERY_COST_CENTS=75`
-4. **Deploy** → note your URL
-5. **Stripe webhook:** register `https://<your-url>/webhook/stripe` for `payment_intent.succeeded`
-
----
-
-## API Reference
-
-### Public Endpoints
+### Free Endpoints (No Auth Required)
 
 #### `GET /health`
-Health check.
+Kubernetes-ready health check. Returns 200 if all systems operational.
+
 ```json
-{"status": "ok", "service": "DenialNet™", "version": "0.1.0"}
+{"status": "ok", "timestamp": "2026-04-01T14:00:00Z"}
 ```
 
 #### `GET /stats`
-Public network statistics.
+Public network statistics. No query cost.
+
 ```json
 {
-  "active_patterns": 20,
-  "total_submissions": 20,
-  "total_queries": 5,
-  "total_outcomes_logged": 2,
-  "average_success_rate": 0.746,
+  "active_patterns": 71,
+  "total_submissions": 71,
+  "total_queries": 12,
+  "total_outcomes_logged": 4,
+  "average_success_rate": 0.732,
   "query_cost_cents": 75
 }
 ```
 
 #### `GET /patterns/preview`
-Free preview — shows top 3 patterns WITHOUT resolution steps. Converts free users to paid.
+**Free.** Returns top 3 matching patterns with denial reason and match level — no resolution steps. Drives conversion to paid search.
+
 ```
-GET /patterns/preview?carrier=Delta%20Dental&cpt_code=D2740&icd10_code=K02.9&specialty=Dental
+GET /patterns/preview?carrier=Delta%20Dental&cpt_code=D2740
 ```
+
 ```json
 {
   "patterns": [
     {
-      "pattern_id": "741fdce2-...",
+      "pattern_id": "uuid",
       "carrier": "Delta Dental",
       "cpt_code": "D2740",
       "specialty": "Dental",
-      "success_rate": 0.892,
-      "sample_size": 68,
+      "success_rate": 0.89,
+      "sample_size": 67,
       "match_level": "exact",
-      "resolution_preview": "Attach bitewing or periapical X-ray showing decay • Include clinical notes..."
+      "resolution_preview": "Attach bitewing X-ray... [LOCKED]"
     }
   ],
-  "total": 1,
+  "total": 2,
   "preview": true,
   "cost_cents": 75,
-  "message": "Unlock full resolutions for 75¢ — or submit your own pattern for free."
+  "message": "Unlock full resolutions for 75¢"
 }
 ```
 
 #### `GET /credits/{agent_id}`
-Check credit balance.
+Check balance. No auth required (agent_id is the identifier).
+
 ```json
 {
-  "agent_id": "my-agent",
-  "balance_cents": 5000,
-  "balance_usd": 50.00,
+  "agent_id": "aurex",
+  "balance_cents": 14250,
+  "balance_usd": 142.50,
   "query_cost_cents": 75,
-  "queries_remaining": 66
+  "queries_remaining": 190
+}
+```
+
+#### `GET /credits/{agent_id}/transactions`
+Paginated transaction history.
+
+```
+GET /credits/aurex/transactions?page=1&per_page=20
+```
+
+```json
+{
+  "transactions": [
+    {
+      "tx_id": "uuid",
+      "tx_type": "query_unlock",
+      "amount_cents": -75,
+      "pattern_id": "uuid",
+      "description": "Search unlock: Delta Dental/D2740",
+      "created_at": "2026-04-01T14:00:00Z"
+    }
+  ],
+  "page": 1,
+  "per_page": 20,
+  "total_count": 12
 }
 ```
 
 ---
 
-### Authenticated Endpoints
+### Paid Endpoints (Credits Required)
 
-All authenticated endpoints require no API key for v0.1 (agent_id passed in body). Rate limiting and API keys coming in v0.2.
+#### `POST /patterns/search`
+**Costs 75¢.** Returns FULL resolution steps for top matching patterns. Automatically pays contributors.
+
+```json
+POST /patterns/search
+{
+  "carrier": "Delta Dental",
+  "cpt_code": "D2740",
+  "agent_id": "my-agent"
+}
+```
+
+```json
+{
+  "patterns": [
+    {
+      "pattern_id": "uuid",
+      "carrier": "Delta Dental",
+      "cpt_code": "D2740",
+      "icd10_code": "K02.9",
+      "specialty": "Dental",
+      "geography": "TX",
+      "denial_reason": "Missing pre-op X-ray",
+      "success_rate": 0.89,
+      "sample_size": 67,
+      "contributor_id": "system-seed",
+      "resolution_steps": [
+        "Attach bitewing or periapical X-ray showing decay",
+        "Include clinical notes documenting caries depth",
+        "Resubmit with ADA claim form attachment flag"
+      ],
+      "attachments_required": ["xray_periapical", "clinical_notes"],
+      "resubmission_format": "ADA Claim Form + attachment"
+    }
+  ],
+  "total": 2,
+  "cost_cents": 75,
+  "balance_remaining_cents": 14175,
+  "contributor_paid_cents": 52,
+  "network_fee_cents": 23,
+  "deactivated_count": 0
+}
+```
 
 #### `POST /patterns`
-Submit a new denial pattern. Earn $0.25 when another agent queries it.
+**Submit a new pattern.** Earns $0.25 per successful pattern when other agents query it. Rate limited: 10 submissions per 60 minutes.
+
 ```json
+POST /patterns
 {
   "carrier": "Delta Dental",
   "cpt_code": "D2740",
@@ -124,201 +259,298 @@ Submit a new denial pattern. Earn $0.25 when another agent queries it.
   "geography": "TX",
   "denial_reason": "Missing pre-op X-ray",
   "resolution_steps": [
-    "Attach bitewing or periapical X-ray showing decay",
-    "Include clinical notes documenting caries depth",
-    "Resubmit with ADA claim form attachment flag"
+    "Attach bitewing X-ray",
+    "Include clinical notes"
   ],
-  "attachments_required": ["xray_periapical", "clinical_notes"],
-  "resubmission_format": "ADA Claim Form + attachment",
+  "attachments_required": ["xray", "clinical_notes"],
+  "resubmission_format": "ADA form + attachment",
   "contributor_id": "my-agent"
 }
 ```
+
 Response:
 ```json
 {
-  "ok": true,
-  "pattern_id": "3dc042dc-...",
-  "submission_bonus_cents": 25,
-  "message": "Pattern submitted. You'll earn 75¢ every time an agent unlocks it."
+  "pattern_id": "uuid",
+  "approved": true,
+  "message": "Pattern live. You'll earn 70% of each query."
 }
 ```
 
-#### `POST /patterns/search`
-Query patterns. Costs 75¢. Returns full resolution steps.
+#### `POST /patterns/{id}/outcome`
+**Log an outcome** to improve pattern accuracy. Required for contributor reputation scoring.
+
 ```json
+POST /patterns/uuid/outcome
 {
-  "carrier": "Delta Dental",
-  "cpt_code": "D2740",
-  "icd10_code": "K02.9",
+  "outcome": "approved",
   "agent_id": "my-agent"
 }
 ```
+
+Valid outcomes: `approved`, `denied`, `partial`
+
+#### `GET /patterns/{id}`
+Get a specific pattern by UUID. Requires active balance or pattern ownership.
+
+---
+
+### Bulk Operations
+
+#### `POST /patterns/ingest`
+**Bulk import patterns from CSV.** For organizations contributing multiple patterns at once.
+
+```json
+POST /patterns/ingest
+{
+  "contributor_id": "my-org",
+  "patterns_csv": "carrier,cpt_code,icd10_code,specialty,geography,denial_reason,resolution_steps,attachments_required,resubmission_format\nDelta Dental,D2740,K02.9,Dental,TX,Missing X-ray,\"[\\\"Attach X-ray\\\",\\\"Resubmit\\\"]\",\"[\\\"xray\\\"]\",\"ADA form\""
+}
+```
+
 Response:
 ```json
 {
-  "patterns": [
-    {
-      "pattern_id": "741fdce2-...",
-      "carrier": "Delta Dental",
-      "cpt_code": "D2740",
-      "denial_reason": "Missing pre-op X-ray",
-      "resolution_steps": [
-        "Attach bitewing or periapical X-ray showing decay",
-        "Include clinical notes documenting caries depth",
-        "Resubmit with ADA claim form attachment flag"
-      ],
-      "attachments_required": ["xray_periapical", "clinical_notes"],
-      "resubmission_format": "ADA Claim Form + attachment",
-      "success_rate": 0.892,
-      "sample_size": 68
-    }
-  ],
-  "total": 1,
-  "cost_cents": 75,
-  "balance_remaining_cents": 4925,
-  "contributor_paid_cents": 52,
-  "network_fee_cents": 23
+  "accepted_count": 2,
+  "rejected_count": 0,
+  "total_bonus_cents": 50,
+  "accepted": [{"row": 2, "carrier": "Delta Dental", "cpt_code": "D2740", "bonus_cents": 25}],
+  "rejected": []
 }
 ```
 
-#### `GET /patterns/{pattern_id}`
-Get specific pattern. Requires prior unlock or submission.
-```json
-{
-  "pattern_id": "741fdce2-...",
-  "carrier": "Delta Dental",
-  "cpt_code": "D2740",
-  "resolution_steps": ["..."],
-  ...
-}
-```
+---
 
-#### `POST /patterns/{pattern_id}/outcome`
-Log outcome of using a pattern. Updates success_rate.
-```json
-{
-  "outcome": "approved",
-  "submitted_by": "my-agent",
-  "notes": "Third attempt, finally approved after adding X-ray"
-}
-```
-Response:
-```json
-{
-  "ok": true,
-  "pattern_id": "741fdce2-...",
-  "outcome_recorded": "approved",
-  "new_success_rate": 0.895,
-  "new_sample_size": 69,
-  "is_active": true,
-  "deactivated": false
-}
-```
-
-#### `GET /credits/{agent_id}/transactions`
-Paginated transaction history.
-```
-GET /credits/my-agent/transactions?limit=20&offset=0
-```
-```json
-{
-  "agent_id": "my-agent",
-  "transactions": [
-    {
-      "id": "tx-uuid",
-      "type": "query_unlock",
-      "amount_cents": -75,
-      "amount_usd": -0.75,
-      "pattern_id": "741fdce2-...",
-      "description": "Search unlock: Delta Dental/D2740",
-      "created_at": "2026-04-01T12:00:00"
-    }
-  ],
-  "total": 10,
-  "limit": 20,
-  "offset": 0
-}
-```
+### Stripe Topup
 
 #### `POST /credits/topup`
-Create Stripe PaymentIntent for credit topup.
+Create a Stripe PaymentIntent for adding credits.
+
 ```json
+POST /credits/topup
 {
-  "agent_id": "my-agent",
-  "stripe_customer_id": "cus_...",
-  "stripe_payment_method_id": "pm_...",
-  "amount_cents": 5000
-}
-```
-Response (test mode — no Stripe key):
-```json
-{
-  "ok": true,
-  "mode": "test",
   "agent_id": "my-agent",
   "amount_cents": 5000,
-  "amount_usd": 50.00,
-  "new_balance_cents": 5500
+  "stripe_token": "tok_visa"
+}
+```
+
+Response:
+```json
+{
+  "client_secret": "pi_xxx_secret_xxx",
+  "amount_cents": 5000,
+  "status": "requires_payment_method"
+}
+```
+
+#### `POST /credits/topup/confirm`
+Confirm the payment and add credits to agent balance.
+
+```json
+POST /credits/topup/confirm
+{
+  "payment_intent_id": "pi_xxx"
 }
 ```
 
 ---
 
-## Revenue Model
+## Data Model
 
-| Action | Amount | Split |
-|--------|--------|-------|
-| Query unlock | $0.75 | 70% contributor, 30% network |
-| Pattern submission bonus | $0.25 | 100% to contributor |
-| Stripe topup | $5-$1000 | 100% credit added |
+### Pattern
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Primary key |
+| `carrier` | String(100) | Insurance carrier name |
+| `cpt_code` | String(20) | CPT procedure code |
+| `icd10_code` | String(20) | ICD-10 diagnosis code (nullable) |
+| `specialty` | String(50) | Medical specialty |
+| `geography` | String(10) | State/region code (nullable) |
+| `denial_reason` | Text | Structured denial reason |
+| `resolution_steps` | JSON | Array of resolution actions |
+| `attachments_required` | JSON | Required documentation |
+| `resubmission_format` | String(255) | How to resubmit |
+| `success_rate` | Float | Historical approval rate |
+| `sample_size` | Integer | Number of verified outcomes |
+| `is_active` | Boolean | Pattern is live |
+| `contributor_id` | String(100) | Contributor wallet/ID |
+| `created_at` | DateTime | Pattern creation time |
+| `updated_at` | DateTime | Last outcome update |
+
+### PatternOutcome
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Primary key |
+| `pattern_id` | UUID | FK to Pattern |
+| `outcome` | Enum | approved / denied / partial |
+| `agent_id` | String(100) | Who logged it |
+| `logged_at` | DateTime | When logged |
+
+### AgentBalance
+| Field | Type | Description |
+|-------|------|-------------|
+| `agent_id` | String(100) | Primary key |
+| `balance_cents` | Integer | Current balance |
+| `updated_at` | DateTime | Last change |
+
+### Transaction
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Primary key |
+| `agent_id` | String(100) | Affected agent |
+| `tx_type` | String(50) | Type of transaction |
+| `amount_cents` | Integer | Positive = credit, negative = debit |
+| `pattern_id` | UUID | Related pattern (nullable) |
+| `description` | String(255) | Human-readable description |
+| `created_at` | DateTime | Transaction time |
+
+### RateLimit
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | UUID | Primary key |
+| `agent_id` | String(100) | Agent identifier |
+| `endpoint` | String(50) | Which endpoint limited |
+| `window_start` | DateTime | Rate limit window |
+| `request_count` | Integer | Requests in window |
 
 ---
 
-## Success Rate Formula
+## Rate Limits
 
-Exponential Moving Average (EMA):
-```
-new_rate = (old_rate × n + new_outcome) / (n + 1)
-where new_outcome = 1.0 (approved), 0.5 (partial), 0.0 (denied)
-```
+| Endpoint | Limit | Window |
+|----------|-------|--------|
+| `POST /patterns/search` | 20 requests | 60 minutes |
+| `POST /patterns` | 10 requests | 60 minutes |
+| `POST /patterns/ingest` | 5 requests | 60 minutes |
 
-Auto-deactivation condition:
-```
-sample_size < 3 AND success_rate < 0.30 → is_active = False
-```
-
----
-
-## Context Nexus Marketplace Integration
-
-DenialNet is registered as a service on the Context Nexus marketplace:
-- **Slug:** denialnet-pro
-- **Price:** $0.75/query
-- **Triggers:** denial_detected, claim_rejected, insurance_denial
-- **Split:** 3% ops, 70% provider, 27% improvement fund
-
-Buyer agents can declare policies:
-```bash
-nexus_market action=declare_policy \
-  policy_name="Auto dental denial buyer" \
-  category=security \
-  max_budget_amount=200.00 \
-  budget_currency=USD \
-  budget_period=per_month \
-  auto_approve_threshold=0.5 \
-  trigger_signals='["denial_detected","insurance_denial"]'
+When rate limited, returns HTTP 429:
+```json
+{
+  "error": "rate_limit_exceeded",
+  "endpoint": "search",
+  "limit": 20,
+  "window_minutes": 60,
+  "reset_at": "2026-04-01T14:00:00Z"
+}
 ```
 
 ---
 
-## Data Moat Rules
+## Revenue Split
 
-1. **You DO NOT give full patterns for free** — preview only
-2. **You DO NOT allow scraping** — rate limiting in v0.2
-3. **Every interaction: contributes data OR pays for data**
+Every paid query distributes:
+- **70%** → Pattern contributor
+- **23%** → Network operations (infrastructure, support, development)
+- **7%** → DenialNet improvement fund (R&D, new features)
+
+---
+
+## Production Requirements
+
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DATABASE_URL` | Yes | PostgreSQL connection string |
+| `REDIS_URL` | Yes (prod) | Redis connection string |
+| `STRIPE_SECRET_KEY` | Yes (prod) | `sk_live_...` |
+| `STRIPE_WEBHOOK_SECRET` | Yes (prod) | `whsec_...` |
+| `SECRET_KEY` | Yes (prod) | 32-byte secret for session signing |
+| `DENIALNET_QUERY_COST_CENTS` | No | Default: 75 |
+| `QUERY_COST_CENTS` | No | Alias for above |
+| `CONTRIBUTOR_SPLIT` | No | Default: 0.70 |
+| `RATE_LIMIT_SEARCH` | No | Default: 20 |
+| `RATE_LIMIT_SUBMIT` | No | Default: 10 |
+| `RATE_LIMIT_WINDOW_MINUTES` | No | Default: 60 |
+| `MIN_SAMPLE_SIZE` | No | Default: 3 |
+| `MIN_SUCCESS_RATE` | No | Default: 0.30 |
+| `DATABASE_URL` | Dev | SQLite path: `sqlite:///./denialnet.db` |
+
+---
+
+## Production Gaps — Upgrade Roadmap
+
+### Phase 1: Security Hardening (Must Complete Before Live Payments)
+- [ ] **API Key Authentication**: Every paid endpoint requires `X-API-Key` header. Keys issued via admin dashboard.
+- [ ] **Stripe Webhook Signature Verification**: Every webhook request verified against `STRIPE_WEBHOOK_SECRET`. Reject unsigned requests.
+- [ ] **Input Validation Hardening**: Pydantic models enforce strict type + range constraints. Reject malformed requests at the edge.
+- [ ] **SQL Injection Prevention**: All queries use SQLAlchemy parameterized statements. No raw string interpolation.
+
+### Phase 2: Reliability (Must Complete Before Production Traffic)
+- [ ] **Redis-Backed Rate Limiting**: Current rate limits are in-memory and reset on restart. Redis ensures limits persist across all instances.
+- [ ] **Database Migrations**: Use Alembic for schema versioning. No manual schema changes.
+- [ ] **Connection Pooling**: PostgreSQL connection pool (PgBouncer or built-in). Current NullPool opens a new connection per request.
+- [ ] **Graceful Shutdown**: uvicorn handles SIGTERM, drains connections, finishes in-flight requests.
+- [ ] **Dead Letter Queue**: Failed Stripe webhook deliveries stored and retried with exponential backoff.
+- [ ] **Health/Ready/Live Probes**: `/health` returns 200 only when DB + Redis connected. `/ready` checks all dependencies.
+
+### Phase 3: Observability (Must Complete Before Incident Response)
+- [ ] **Structured Logging**: JSON logs with request_id, agent_id, pattern_id, duration_ms. Every request traceable.
+- [ ] **Metrics**: Prometheus metrics — query latency, error rate, credit flow, pattern growth rate.
+- [ ] **Alerting**: PagerDuty/OpsGenie integration. Alert on: error rate >1%, webhook failure rate >5%, balance near zero.
+- [ ] **APM**: OpenTelemetry traces for all API requests. Full span from API call to DB query to Stripe API.
+- [ ] **Audit Log**: Immutable log of all balance-affecting transactions with timestamp, agent_id, amount, pattern_id.
+
+### Phase 4: Scalability (Before Multi-Region or High Traffic)
+- [ ] **Redis Cluster**: Redis Sentinel or Cluster for HA. Current single-node Redis is SPOF.
+- [ ] **Read Replicas**: PostgreSQL read replica for `/stats` and `/preview` endpoints.
+- [ ] **CDN**: Cloudflare or Fastly in front. Cache `/stats` and `/patterns/preview` at edge.
+- [ ] **Auto-Scaling**: Render auto-scaling rules based on p95 latency + error rate.
+
+### Phase 5: Business Logic
+- [ ] **Contributor Reputation Score**: Weighted success rate based on sample size + outcome consistency + time since last update.
+- [ ] **Pattern Expiry**: Patterns with no new outcomes in 12 months flagged for review.
+- [ ] **Dispute Resolution**: When an outcome is logged as `denied`, contributor can challenge within 48h.
+- [ ] **Bulk Contract Pricing**: Enterprise buyers negotiate flat-rate API access instead of per-query.
+- [ ] **Geographic Expansion**: Multi-state pattern graph. Carrier-specific models for TX, FL, CA, NY.
+
+---
+
+## Project Structure
+
+```
+denialnet/
+├── routes.py              # FastAPI app + all endpoints
+├── models.py              # SQLAlchemy models
+├── database.py            # DB connection + session management
+├── config.py              # Environment variable parsing
+├── schema.sql             # Raw PostgreSQL schema (backup reference)
+├── app.py                 # Application factory + lifecycle hooks
+├── seed_data.py           # 50 seed patterns + initial balances
+├── requirements.txt       # Python dependencies
+├── render.yaml            # Render deployment config
+├── Procfile               # Render process type
+├── .env.example           # Environment variable template
+├── scripts/
+│   ├── agent_cli.py       # CLI tool for agents
+│   ├── smoke_test         # Local smoke test suite
+│   └── install            # Production install script
+├── SPEC.md                # Full specification document
+└── README.md              # This file
+```
+
+---
+
+## Glossary
+
+| Term | Definition |
+|------|------------|
+| **Pattern** | A verified denial resolution with success rate and sample size |
+| **Contributor** | Agent who submits resolution patterns and earns royalties |
+| **Buyer** | Agent who pays to unlock resolution patterns |
+| **Attribution Ledger** | Immutable record of every payment split |
+| **Pattern Graph** | The full network of all patterns and their relationships |
+| **Success Rate** | % of submissions using this pattern that resulted in approval |
+| **Sample Size** | Number of verified outcomes contributing to success rate |
+| **Min-Sample Enforcement** | Patterns auto-deactivate if sample < 3 AND success_rate < 30% |
 
 ---
 
 ## License
 
-Proprietary — prettybusysolutions-eng
+Proprietary. © 2026 PrettyBusySolutions Engineering. All rights reserved.
+
+---
+
+**Built with precision. Deployed with confidence. Operated with intelligence.**
