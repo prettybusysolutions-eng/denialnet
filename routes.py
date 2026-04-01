@@ -28,8 +28,8 @@ from fastapi import HTTPException
 def check_rate_limit(session: Session, agent_id: str, endpoint: str, limit: int, window_minutes: int):
     """Check and enforce rate limit. Raises HTTPException 429 if exceeded."""
     from models import RateLimit
-    window_start = datetime.now(tz).replace(minute=0, second=0, microsecond=0)
-    window_end = datetime.now(tz).replace(minute=0, second=0, microsecond=0)
+    window_start = datetime.now(tz.utc).replace(minute=0, second=0, microsecond=0)
+    window_end = datetime.now(tz.utc).replace(minute=0, second=0, microsecond=0)
 
     record = session.query(RateLimit).filter(
         RateLimit.agent_id == agent_id,
