@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""DenialNet™ Smoke Test"""
+import requests
+import os
+import sys
+
+BASE = os.environ.get("DENIALNET_URL", "http://localhost:8000")
+
+def test(name, fn):
+    try:
+        r = fn()
+        print(f"  ✓ {name}")
+        return True
+    except Exception as e:
+        print(f"  ✗ {name}: {e}")
+        return False
+
+def main():
+    print("DenialNet™ Smoke Test")
+    print("=" * 40)
+
+    results = []
+
+    # Health
+    results.append(test("Health", lambda: requests.get(f"{BASE}/health").raise_for_status()))
+
+    # Seeded patterns exist
+    r = requests.get(f"{BASE}/patterns/D2740", params={"cpt": "D2740"}).json()
+    results.append(test("Query D2740 patterns", lambda: r))
+
+    # Credit balance
+    results.append(test("Credits query", lambda: requests.get(f"{BASE}/credits/test-agent").raise_for_status()))
+
+    # Submit pattern
+    results.append(test("Submit pattern", lambda: requests.post(f"{BASE}/patterns", json={
+        "carrier": "Test Insurance",
+        "cpt_code": "D9999",
+        "specialty": "Dental",
+        "denial_reason": "Test denial",
+        "resolution_steps": ["Step 1", "Step 2"],
+        "contributor_id": "smoke-test"
+    }).raise_for_status()))
+
+    print("=" * 40)
+    passed = sum(results)
+    total = len(results)
+    print(f"  {passed}/{total} passed")
+
+    if passed == total:
+        print("  All smoke tests passed ✓")
+        sys.exit(0)
+    else:
+        print("  Some tests failed")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

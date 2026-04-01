@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: denialnet
+    env: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn "app:routes" -b 0.0.0.0:$PORT --workers 2 --threads 4
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: DENIALNET_QUERY_COST_CENTS
+        value: "75"
+      - key: DENIALNET_CONTRIBUTOR_SPLIT
+        value: "0.70"

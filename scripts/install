@@ -1,0 +1,15 @@
+#!/bin/bash
+set -e
+echo "Installing DenialNet™..."
+
+# Create venv
+python3 -m venv venv
+source venv/bin/activate
+
+# Install
+pip install -r requirements.txt
+
+# Seed
+python seed_data.py
+
+echo "Done. Run: uvicorn routes:app --reload --port 8000"
