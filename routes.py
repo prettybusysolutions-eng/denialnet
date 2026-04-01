@@ -200,6 +200,22 @@ class PatternSubmit(BaseModel):
     resubmission_format: Optional[str] = None
     contributor_id: str = Field(..., min_length=1, max_length=100)
 
+    @field_validator('cpt_code')
+    @classmethod
+    def cpt_code_format(cls, v):
+        import re
+        if not re.match(r'^[A-Z0-9]+$', v.upper()):
+            raise ValueError('cpt_code must be alphanumeric uppercase')
+        return v.upper()
+
+    @field_validator('contributor_id')
+    @classmethod
+    def agent_id_format(cls, v):
+        import re
+        if not re.match(r'^[a-zA-Z0-9_-]+$', v):
+            raise ValueError('contributor_id must be alphanumeric, hyphens, or underscores only')
+        return v
+
     @field_validator('resolution_steps')
     @classmethod
     def steps_not_empty(cls, v):
@@ -215,6 +231,22 @@ class PatternSearchQuery(BaseModel):
     denial_reason: Optional[str] = None
     specialty: Optional[str] = None
     agent_id: str
+
+    @field_validator('cpt_code')
+    @classmethod
+    def cpt_code_format(cls, v):
+        import re
+        if not re.match(r'^[A-Z0-9]+$', v.upper()):
+            raise ValueError('cpt_code must be alphanumeric uppercase')
+        return v.upper()
+
+    @field_validator('agent_id')
+    @classmethod
+    def agent_id_format(cls, v):
+        import re
+        if not re.match(r'^[a-zA-Z0-9_-]+$', v):
+            raise ValueError('agent_id must be alphanumeric, hyphens, or underscores only')
+        return v
 
 
 class OutcomeSubmit(BaseModel):
@@ -234,13 +266,21 @@ class StripeTopupRequest(BaseModel):
     agent_id: str
     stripe_customer_id: str
     stripe_payment_method_id: str
-    amount_cents: int = Field(..., gt=0, le=100000)  # max $1000
+    amount_cents: int = Field(..., ge=100, le=100000)  # min $1, max $1000
+
+    @field_validator('agent_id')
+    @classmethod
+    def agent_id_format(cls, v):
+        import re
+        if not re.match(r'^[a-zA-Z0-9_-]+$', v):
+            raise ValueError('agent_id must be alphanumeric, hyphens, or underscores only')
+        return v
 
     @field_validator('amount_cents')
     @classmethod
     def minimum_topup(cls, v):
-        if v < settings.MIN_CREDITS_CENTS:
-            raise ValueError(f'Minimum topup is {settings.MIN_CREDITS_CENTS}¢')
+        if v < 100:
+            raise ValueError('Minimum topup is 100¢ ($1)')
         return v
 
 
