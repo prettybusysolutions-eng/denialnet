@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, Text, ForeignKey, CheckConstraint, DateTime, JSON
+from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, Text, ForeignKey, CheckConstraint, DateTime as SAType, JSON, Index
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base, relationship, Session
 from sqlalchemy.sql import func
@@ -24,8 +24,8 @@ class Pattern(Base):
     sample_size = Column(Integer, nullable=False, default=1)
     contributor_id = Column(String(100), nullable=False)
     is_active = Column(Boolean, nullable=False, default=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at = Column(SAType(timezone=True), server_default=func.now())
+    updated_at = Column(SAType(timezone=True), server_default=func.now(), onupdate=func.now())
 
     outcomes = relationship("PatternOutcome", back_populates="pattern")
 
@@ -43,7 +43,7 @@ class PatternOutcome(Base):
     outcome = Column(String(20), nullable=False)  # approved, denied, partial
     submitted_by = Column(String(100), nullable=False)
     notes = Column(Text)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(SAType(timezone=True), server_default=func.now())
 
     pattern = relationship("Pattern", back_populates="outcomes")
 
@@ -53,8 +53,8 @@ class AgentBalance(Base):
 
     agent_id = Column(String(100), primary_key=True)
     balance_cents = Column(Integer, nullable=False, default=0)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at = Column(SAType(timezone=True), server_default=func.now())
+    updated_at = Column(SAType(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class Transaction(Base):
@@ -62,11 +62,26 @@ class Transaction(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id = Column(String(100), nullable=False, index=True)
-    tx_type = Column(String(30), nullable=False)  # query_unlock, pattern_submit, credit_topup, payout, network_fee
+    tx_type = Column(String(30), nullable=False)
     amount_cents = Column(Integer, nullable=False)
     pattern_id = Column(UUID(as_uuid=True), ForeignKey("patterns.id"))
     description = Column(Text)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(SAType(timezone=True), server_default=func.now())
+
+
+class RateLimit(Base):
+    """Per-agent, per-endpoint rate limit tracking."""
+    __tablename__ = "rate_limits"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id = Column(String(100), nullable=False)
+    endpoint = Column(String(50), nullable=False)
+    window_start = Column(SAType(timezone=True), server_default=func.now())
+    request_count = Column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        Index('idx_rate_agent_endpoint', 'agent_id', 'endpoint'),
+    )
 
 
 class StripeCustomer(Base):
@@ -74,4 +89,4 @@ class StripeCustomer(Base):
 
     agent_id = Column(String(100), primary_key=True)
     stripe_customer_id = Column(String(100), nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(SAType(timezone=True), server_default=func.now())

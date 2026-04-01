@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     CONTRIBUTOR_SPLIT: float = 0.70  # 70% to contributor
     NETWORK_SPLIT: float = 0.30  # 30% to network ops
     MIN_SAMPLE_SIZE: int = 3  # patterns with fewer samples auto-deactivated
+    RATE_LIMIT_SEARCH: int = 20      # max search queries per window
+    RATE_LIMIT_SUBMIT: int = 10      # max pattern submissions per window
+    RATE_LIMIT_WINDOW_MINUTES: int = 60  # rolling window
 
     class Config:
         env_prefix = "DENIALNET_"

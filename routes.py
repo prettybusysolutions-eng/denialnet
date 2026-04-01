@@ -12,11 +12,49 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, desc, func
 from database import get_session, init_db
-from models import Pattern, PatternOutcome, AgentBalance, Transaction, StripeCustomer
+from models import Pattern, PatternOutcome, AgentBalance, Transaction, StripeCustomer, RateLimit
 from config import settings
 import json
 
 app = FastAPI(title="DenialNet™", version="0.1.0")
+
+# ── Rate Limiting ──────────────────────────────────────────────────────────────
+
+from datetime import datetime, timezone as tz
+from functools import wraps
+from fastapi import HTTPException
+
+
+def check_rate_limit(session: Session, agent_id: str, endpoint: str, limit: int, window_minutes: int):
+    """Check and enforce rate limit. Raises HTTPException 429 if exceeded."""
+    from models import RateLimit
+    window_start = datetime.now(tz).replace(minute=0, second=0, microsecond=0)
+    window_end = datetime.now(tz).replace(minute=0, second=0, microsecond=0)
+
+    record = session.query(RateLimit).filter(
+        RateLimit.agent_id == agent_id,
+        RateLimit.endpoint == endpoint,
+        RateLimit.window_start >= window_start
+    ).first()
+
+    if record:
+        if record.request_count >= limit:
+            raise HTTPException(429, {
+                "error": "rate_limit_exceeded",
+                "endpoint": endpoint,
+                "limit": limit,
+                "window_minutes": window_minutes,
+                "reset_at": window_start.isoformat(),
+                "message": f"Rate limit: {limit} requests per {window_minutes}min. Resets at {window_start.isoformat()}."
+            })
+        record.request_count += 1
+    else:
+        session.add(RateLimit(
+            agent_id=agent_id,
+            endpoint=endpoint,
+            window_start=window_start,
+            request_count=1
+        ))
 
 # ── Pydantic Schemas ──────────────────────────────────────────────────────────
 
@@ -232,6 +270,10 @@ def submit_pattern(data: PatternSubmit, session: Session = Depends(db)):
     if len(data.resolution_steps) < 1:
         raise HTTPException(400, "At least one resolution step is required")
 
+    # Rate limit check
+    check_rate_limit(session, data.contributor_id, "submit",
+                     settings.RATE_LIMIT_SUBMIT, settings.RATE_LIMIT_WINDOW_MINUTES)
+
     pattern = Pattern(
         carrier=data.carrier.strip(),
         cpt_code=data.cpt_code.strip().upper(),
@@ -285,6 +327,11 @@ def search_patterns(data: PatternSearchQuery, session: Session = Depends(db)):
     # Check balance
     ensure_balance(session, data.agent_id)
     bal = session.query(AgentBalance).filter_by(agent_id=data.agent_id).first()
+
+    # Rate limit check
+    check_rate_limit(session, data.agent_id, "search",
+                     settings.RATE_LIMIT_SEARCH, settings.RATE_LIMIT_WINDOW_MINUTES)
+
     cost = settings.QUERY_COST_CENTS
     if bal.balance_cents < cost:
         raise HTTPException(402, {
@@ -488,6 +535,101 @@ def get_transactions(agent_id: str, limit: int = Query(20, ge=1, le=200),
         "total": total,
         "limit": limit,
         "offset": offset,
+    }
+
+
+# ── CSV Ingest ──────────────────────────────────────────────────────────────
+
+import csv
+import io
+
+
+class CSVIngestRequest(BaseModel):
+    contributor_id: str = Field(..., min_length=1, max_length=100)
+    patterns_csv: str = Field(..., min_length=10)  # CSV as string
+
+
+@app.post("/patterns/ingest")
+def ingest_patterns_csv(data: CSVIngestRequest, session: Session = Depends(db)):
+    """
+    Bulk ingest patterns from CSV.
+    CSV format: carrier,cpt_code,icd10_code,specialty,geography,denial_reason,resolution_steps (JSON array),attachments_required (JSON array),resubmission_format
+    First row must be header.
+    Returns: {accepted: N, rejected: N, errors: [...]}
+    """
+    reader = csv.DictReader(io.StringIO(data.patterns_csv))
+    accepted = []
+    rejected = []
+    required = ["carrier", "cpt_code", "denial_reason", "resolution_steps"]
+    check_rate_limit(session, data.contributor_id, "submit",
+                     settings.RATE_LIMIT_SUBMIT, settings.RATE_LIMIT_WINDOW_MINUTES)
+
+    for i, row in enumerate(reader):
+        row_num = i + 2  # +2 for 1-indexed + header row
+        try:
+            # Validate required fields
+            missing = [f for f in required if not row.get(f, "").strip()]
+            if missing:
+                rejected.append({"row": row_num, "error": f"missing_required_fields: {missing}"})
+                continue
+
+            # Parse resolution_steps (JSON array as string)
+            try:
+                steps = json.loads(row["resolution_steps"])
+                if not isinstance(steps, list) or not steps:
+                    raise ValueError("must be a JSON array with at least one step")
+            except (json.JSONDecodeError, ValueError) as e:
+                rejected.append({"row": row_num, "error": f"resolution_steps parse error: {e}"})
+                continue
+
+            # Parse attachments (optional JSON array)
+            attachments = None
+            if row.get("attachments_required", "").strip():
+                try:
+                    attachments = json.loads(row["attachments_required"])
+                except json.JSONDecodeError:
+                    attachments = [a.strip() for a in row["attachments_required"].split(",") if a.strip()]
+
+            pattern = Pattern(
+                carrier=row["carrier"].strip(),
+                cpt_code=row["cpt_code"].strip().upper(),
+                icd10_code=row.get("icd10_code", "").strip().upper() or None,
+                specialty=row.get("specialty", "Dental").strip(),
+                geography=row.get("geography", "").strip().upper() or None,
+                denial_reason=row["denial_reason"].strip(),
+                resolution_steps=steps,
+                attachments_required=attachments,
+                resubmission_format=row.get("resubmission_format", "").strip() or None,
+                success_rate=1.0,
+                sample_size=1,
+                contributor_id=data.contributor_id.strip(),
+            )
+            session.add(pattern)
+
+            # Credit contributor per pattern (capped at batch bonus)
+            ensure_balance(session, data.contributor_id)
+            bal = session.query(AgentBalance).filter_by(agent_id=data.contributor_id).first()
+            bal.balance_cents += 25  # $0.25 per pattern
+
+            accepted.append({
+                "row": row_num,
+                "carrier": pattern.carrier,
+                "cpt_code": pattern.cpt_code,
+                "bonus_cents": 25
+            })
+
+        except Exception as e:
+            rejected.append({"row": row_num, "error": str(e)})
+
+    if accepted:
+        session.commit()
+
+    return {
+        "accepted_count": len(accepted),
+        "rejected_count": len(rejected),
+        "total_bonus_cents": len(accepted) * 25,
+        "accepted": accepted[:20],  # cap response size
+        "rejected": rejected[:20],
     }
 
 
