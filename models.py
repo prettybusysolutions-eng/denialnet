@@ -90,3 +90,33 @@ class StripeCustomer(Base):
     agent_id = Column(String(100), primary_key=True)
     stripe_customer_id = Column(String(100), nullable=False)
     created_at = Column(SAType(timezone=True), server_default=func.now())
+
+
+class APIKey(Base):
+    """API key authentication table. Keys are stored as SHA-256 hashes."""
+    __tablename__ = "api_keys"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    key_hash = Column(String(64), nullable=False, unique=True, index=True)
+    name = Column(String(100), nullable=False)
+    agent_id = Column(String(100), nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    rate_limit_override = Column(Integer, nullable=True)
+    created_at = Column(SAType(timezone=True), server_default=func.now())
+    last_used_at = Column(SAType(timezone=True), nullable=True)
+
+
+class WebhookDLQ(Base):
+    """Dead letter queue for failed Stripe webhook events."""
+    __tablename__ = "webhook_dlq"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    stripe_event_id = Column(String(100), nullable=False, unique=True)
+    event_type = Column(String(100), nullable=False)
+    payload = Column(Text, nullable=False)
+    error_message = Column(Text, nullable=False)
+    retry_count = Column(Integer, default=0, nullable=False)
+    status = Column(String(20), default="pending", nullable=False)
+    created_at = Column(SAType(timezone=True), server_default=func.now())
+    last_retry_at = Column(SAType(timezone=True), nullable=True)
+    resolved_at = Column(SAType(timezone=True), nullable=True)

@@ -1,60 +1,169 @@
 """
 DenialNet™ — Federated Claim Intelligence Protocol
-routes.py — Complete v0.1 with preview, Stripe topup, and min-sample enforcement
+routes.py — v0.2 with API key auth, Redis rate limiting, Stripe webhooks, DLQ
 """
 import uuid as uuid_lib
-from datetime import datetime
+import hashlib
+import hmac
+from datetime import datetime, timezone
 from typing import Optional
 from decimal import Decimal
 
-from fastapi import FastAPI, HTTPException, Depends, Query, Request, Header
+from fastapi import FastAPI, HTTPException, Depends, Query, Request, Header, Body
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, desc, func
 from database import get_session, init_db
-from models import Pattern, PatternOutcome, AgentBalance, Transaction, StripeCustomer, RateLimit
+from models import Pattern, PatternOutcome, AgentBalance, Transaction, StripeCustomer, RateLimit, APIKey, WebhookDLQ
 from config import settings
 import json
 
 app = FastAPI(title="DenialNet™", version="0.1.0")
 
+# ── API Key Authentication ────────────────────────────────────────────────────
+
+import hashlib
+
+
+def _hash_api_key(key: str) -> str:
+    """SHA-256 hash of an API key."""
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def _verify_api_key(session: Session, provided_key: str):
+    """
+    Verify an API key against the database.
+    Returns the APIKey record if valid and active.
+    Raises HTTPException 401 if invalid.
+    """
+    if not provided_key:
+        raise HTTPException(401, {"error": "missing_api_key", "message": "X-API-Key header required"})
+    key_hash = _hash_api_key(provided_key)
+    key_record = session.query(APIKey).filter(
+        APIKey.key_hash == key_hash,
+        APIKey.is_active == True
+    ).first()
+    if not key_record:
+        raise HTTPException(401, {"error": "invalid_api_key", "message": "Invalid or inactive API key"})
+    key_record.last_used_at = datetime.now(timezone.utc)
+    session.commit()
+    return key_record
+
+
+def require_api_key(x_api_key: str = Header(None, alias="X-API-Key")):
+    """Dependency: requires a valid API key."""
+    def dep(session: Session = Depends(get_session)):
+        return _verify_api_key(session, x_api_key)
+    return dep
+
+
+class APIKeyAuth:
+    """API key verification dependency for FastAPI routes."""
+    def __init__(self):
+        pass
+    def __call__(self, session: Session = Depends(get_session), x_api_key: str = Header(None)):
+        return _verify_api_key(session, x_api_key)
+
+
+require_auth = APIKeyAuth()
+
+
+class CreateAPIKeyRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    agent_id: str = Field(None, max_length=100)
+    rate_limit_override: int = Field(None, ge=10, le=10000)
+
+
+def _create_api_key(session: Session, name: str, agent_id: str = None, rate_limit_override: int = None):
+    """Create a new API key. Returns (raw_key, key_record)."""
+    raw_key = uuid_lib.uuid4().hex + uuid_lib.uuid4().hex  # 64-byte random key
+    key_hash = _hash_api_key(raw_key)
+    key_record = APIKey(
+        key_hash=key_hash,
+        name=name,
+        agent_id=agent_id,
+        is_active=True,
+        rate_limit_override=rate_limit_override
+    )
+    session.add(key_record)
+    session.commit()
+    return raw_key, key_record
+
+
 # ── Rate Limiting ──────────────────────────────────────────────────────────────
 
-from datetime import datetime, timezone as tz
-from functools import wraps
-from fastapi import HTTPException
+_redis_client = None
+
+
+def _get_redis_client():
+    """Lazily initialize Redis client. Returns None if REDIS_URL not configured."""
+    global _redis_client
+    if _redis_client is None and settings.REDIS_URL:
+        try:
+            import redis
+            _redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+            _redis_client.ping()
+            print("[RATE] Redis connected for rate limiting")
+        except Exception as e:
+            print(f"[RATE] Redis unavailable, using in-memory fallback: {e}")
+            _redis_client = None
+    return _redis_client
 
 
 def check_rate_limit(session: Session, agent_id: str, endpoint: str, limit: int, window_minutes: int):
-    """Check and enforce rate limit. Raises HTTPException 429 if exceeded."""
-    from models import RateLimit
-    window_start = datetime.now(tz.utc).replace(minute=0, second=0, microsecond=0)
-    window_end = datetime.now(tz.utc).replace(minute=0, second=0, microsecond=0)
+    """Check and enforce rate limit. Uses Redis if available, falls back to in-memory DB."""
+    redis_client = _get_redis_client()
 
-    record = session.query(RateLimit).filter(
-        RateLimit.agent_id == agent_id,
-        RateLimit.endpoint == endpoint,
-        RateLimit.window_start >= window_start
-    ).first()
+    if redis_client:
+        # Redis-backed rate limiting
+        window_key = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+        key = f"rl:{agent_id}:{endpoint}:{window_key}"
+        try:
+            current = redis_client.incr(key)
+            if current == 1:
+                redis_client.expire(key, window_minutes * 60)
+            if current > limit:
+                window_start = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+                raise HTTPException(429, {
+                    "error": "rate_limit_exceeded",
+                    "endpoint": endpoint,
+                    "limit": limit,
+                    "window_minutes": window_minutes,
+                    "reset_at": window_start.isoformat()
+                })
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"[RATE] Redis error: {e} — falling back to DB")
+            _redis_client = None  # Force fallback on next call
 
-    if record:
-        if record.request_count >= limit:
-            raise HTTPException(429, {
-                "error": "rate_limit_exceeded",
-                "endpoint": endpoint,
-                "limit": limit,
-                "window_minutes": window_minutes,
-                "reset_at": window_start.isoformat(),
-                "message": f"Rate limit: {limit} requests per {window_minutes}min. Resets at {window_start.isoformat()}."
-            })
-        record.request_count += 1
-    else:
-        session.add(RateLimit(
-            agent_id=agent_id,
-            endpoint=endpoint,
-            window_start=window_start,
-            request_count=1
-        ))
+    if not redis_client:
+        # In-memory DB fallback
+        window_start = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        record = session.query(RateLimit).filter(
+            RateLimit.agent_id == agent_id,
+            RateLimit.endpoint == endpoint,
+            RateLimit.window_start >= window_start
+        ).first()
+
+        if record:
+            if record.request_count >= limit:
+                window_ts = window_start.isoformat()
+                raise HTTPException(429, {
+                    "error": "rate_limit_exceeded",
+                    "endpoint": endpoint,
+                    "limit": limit,
+                    "window_minutes": window_minutes,
+                    "reset_at": window_ts
+                })
+            record.request_count += 1
+        else:
+            session.add(RateLimit(
+                agent_id=agent_id,
+                endpoint=endpoint,
+                window_start=window_start,
+                request_count=1
+            ))
 
 # ── Pydantic Schemas ──────────────────────────────────────────────────────────
 
@@ -189,6 +298,98 @@ def _enforce_min_sample(session: Session):
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
+# ── Admin: API Key Management ──────────────────────────────────────────────
+
+class CreateAPIKeyRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    agent_id: str = Field(None, max_length=100)
+    rate_limit_override: int = Field(None, ge=10, le=10000)
+
+
+@app.post("/admin/keys")
+def admin_create_key(
+    data: CreateAPIKeyRequest,
+    session: Session = Depends(db),
+    x_admin_key: str = Header(None, alias="X-Admin-Key")
+):
+    """
+    Create a new API key. Requires X-Admin-Key header matching DENIALNET_ADMIN_API_KEY env var.
+    """
+    if not settings.ADMIN_API_KEY:
+        raise HTTPException(503, {"error": "admin_not_configured", "message": "DENIALNET_ADMIN_API_KEY not set on server"})
+    if x_admin_key != settings.ADMIN_API_KEY:
+        raise HTTPException(401, {"error": "unauthorized", "message": "Invalid admin key"})
+    raw_key, key_record = _create_api_key(session, data.name, data.agent_id, data.rate_limit_override)
+    return {
+        "api_key": raw_key,
+        "name": key_record.name,
+        "agent_id": key_record.agent_id,
+        "created_at": key_record.created_at.isoformat() if key_record.created_at else None,
+        "warning": "Store this key securely. It cannot be retrieved again."
+    }
+
+
+class APIKeyInfo(BaseModel):
+    id: str; name: str; agent_id: Optional[str]; is_active: bool
+    rate_limit_override: Optional[int]; created_at: Optional[datetime]
+    last_used_at: Optional[datetime]
+
+
+@app.get("/admin/keys", response_model=list[APIKeyInfo])
+def admin_list_keys(
+    session: Session = Depends(db),
+    x_admin_key: str = Header(None, alias="X-Admin-Key")
+):
+    """List all API keys (never returns the key itself)."""
+    if not settings.ADMIN_API_KEY or x_admin_key != settings.ADMIN_API_KEY:
+        raise HTTPException(401, {"error": "unauthorized"})
+    keys = session.query(APIKey).order_by(desc(APIKey.created_at)).limit(100).all()
+    return [APIKeyInfo(
+        id=str(k.id), name=k.name, agent_id=k.agent_id, is_active=k.is_active,
+        rate_limit_override=k.rate_limit_override, created_at=k.created_at, last_used_at=k.last_used_at
+    ) for k in keys]
+
+
+@app.delete("/admin/keys/{key_id}")
+def admin_revoke_key(
+    key_id: str,
+    session: Session = Depends(db),
+    x_admin_key: str = Header(None, alias="X-Admin-Key")
+):
+    """Revoke an API key."""
+    if not settings.ADMIN_API_KEY or x_admin_key != settings.ADMIN_API_KEY:
+        raise HTTPException(401, {"error": "unauthorized"})
+    key = session.query(APIKey).filter(APIKey.id == key_id).first()
+    if not key:
+        raise HTTPException(404, "API key not found")
+    key.is_active = False
+    session.commit()
+    return {"revoked": True, "key_id": key_id}
+
+
+# ── Admin: DLQ Management ─────────────────────────────────────────────────
+
+class DLQStatus(BaseModel):
+    pending: int; failed: int; resolved: int; total: int
+
+
+@app.get("/admin/dlq", response_model=DLQStatus)
+def admin_dlq_status(
+    session: Session = Depends(db),
+    x_admin_key: str = Header(None, alias="X-Admin-Key")
+):
+    if not settings.ADMIN_API_KEY or x_admin_key != settings.ADMIN_API_KEY:
+        raise HTTPException(401, {"error": "unauthorized"})
+    """Get webhook DLQ status counts."""
+    from models import WebhookDLQ
+    pending = session.query(WebhookDLQ).filter(WebhookDLQ.status == 'pending').count()
+    failed = session.query(WebhookDLQ).filter(WebhookDLQ.status == 'failed').count()
+    resolved = session.query(WebhookDLQ).filter(WebhookDLQ.status == 'resolved').count()
+    return DLQStatus(pending=pending, failed=failed, resolved=resolved, total=pending+failed+resolved)
+
+
+# ── Health ──────────────────────────────────────────────────────────────────
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "DenialNet™", "version": "0.1.0"}
@@ -264,8 +465,9 @@ def preview_patterns(
 # ── Pattern Submission ────────────────────────────────────────────────────────
 
 @app.post("/patterns")
-def submit_pattern(data: PatternSubmit, session: Session = Depends(db)):
-    """Submit a new denial resolution pattern. Contributor earns $0.25 on first query of their pattern."""
+def submit_pattern(data: PatternSubmit, session: Session = Depends(db), x_api_key: str = Header(None)):
+    """Submit a new denial resolution pattern. Requires X-API-Key."""
+    _verify_api_key(session, x_api_key)
     # Enforce minimum quality
     if len(data.resolution_steps) < 1:
         raise HTTPException(400, "At least one resolution step is required")
@@ -318,12 +520,14 @@ def submit_pattern(data: PatternSubmit, session: Session = Depends(db)):
 # ── Pattern Query (paid unlock) ───────────────────────────────────────────────
 
 @app.post("/patterns/search")
-def search_patterns(data: PatternSearchQuery, session: Session = Depends(db)):
+def search_patterns(data: PatternSearchQuery, session: Session = Depends(db), x_api_key: str = Header(None)):
     """
     Query denial patterns. Costs credits.
     Returns FULL resolutions for top matching patterns.
     Contributors paid automatically based on split table.
+    Requires X-API-Key header.
     """
+    _verify_api_key(session, x_api_key)
     # Check balance
     ensure_balance(session, data.agent_id)
     bal = session.query(AgentBalance).filter_by(agent_id=data.agent_id).first()
@@ -442,11 +646,12 @@ def get_pattern(pattern_id: str, session: Session = Depends(db)):
 # ── Outcome submission ────────────────────────────────────────────────────────
 
 @app.post("/patterns/{pattern_id}/outcome")
-def submit_outcome(pattern_id: str, data: OutcomeSubmit, session: Session = Depends(db)):
+def submit_outcome(pattern_id: str, data: OutcomeSubmit, session: Session = Depends(db), x_api_key: str = Header(None)):
     """
     Log outcome of using a pattern. Updates success_rate using exponential moving average.
-    Patterns with sample_size < MIN and success_rate < 0.30 are auto-deactivated.
+    Requires X-API-Key.
     """
+    _verify_api_key(session, x_api_key)
     try:
         pid = uuid_lib.UUID(pattern_id)
     except ValueError:
@@ -550,9 +755,9 @@ class CSVIngestRequest(BaseModel):
 
 
 @app.post("/patterns/ingest")
-def ingest_patterns_csv(data: CSVIngestRequest, session: Session = Depends(db)):
+def ingest_patterns_csv(data: CSVIngestRequest, session: Session = Depends(db), x_api_key: str = Header(None)):
     """
-    Bulk ingest patterns from CSV.
+    Bulk ingest patterns from CSV. Requires X-API-Key.
     CSV format: carrier,cpt_code,icd10_code,specialty,geography,denial_reason,resolution_steps (JSON array),attachments_required (JSON array),resubmission_format
     First row must be header.
     Returns: {accepted: N, rejected: N, errors: [...]}
@@ -561,6 +766,7 @@ def ingest_patterns_csv(data: CSVIngestRequest, session: Session = Depends(db)):
     accepted = []
     rejected = []
     required = ["carrier", "cpt_code", "denial_reason", "resolution_steps"]
+    _verify_api_key(session, x_api_key)
     check_rate_limit(session, data.contributor_id, "submit",
                      settings.RATE_LIMIT_SUBMIT, settings.RATE_LIMIT_WINDOW_MINUTES)
 
@@ -636,11 +842,11 @@ def ingest_patterns_csv(data: CSVIngestRequest, session: Session = Depends(db)):
 # ── Stripe Topup ─────────────────────────────────────────────────────────────
 
 @app.post("/credits/topup")
-def create_topup_intent(data: StripeTopupRequest, session: Session = Depends(db)):
+def create_topup_intent(data: StripeTopupRequest, session: Session = Depends(db), x_api_key: str = Header(None)):
     """
-    Create a Stripe PaymentIntent for credit topup.
-    On success, credits are added to the agent's balance.
+    Create a Stripe PaymentIntent for credit topup. Requires X-API-Key.
     """
+    _verify_api_key(session, x_api_key)
     if not settings.STRIPE_SECRET_KEY or settings.STRIPE_SECRET_KEY.startswith("sk_live_") == False:
         # Return mock success in dev/test
         if settings.STRIPE_SECRET_KEY in (None, "", "sk_test_xxx"):
@@ -691,8 +897,9 @@ def create_topup_intent(data: StripeTopupRequest, session: Session = Depends(db)
 
 
 @app.post("/credits/topup/confirm")
-def confirm_topup(data: TopupConfirmRequest, session: Session = Depends(db)):
-    """Confirm a Stripe topup after PaymentIntent succeeds. Adds credits to agent."""
+def confirm_topup(data: TopupConfirmRequest, session: Session = Depends(db), x_api_key: str = Header(None)):
+    """Confirm a Stripe topup after PaymentIntent succeeds. Requires X-API-Key."""
+    _verify_api_key(session, x_api_key)
     if not settings.STRIPE_SECRET_KEY or settings.STRIPE_SECRET_KEY == "sk_test_xxx":
         return {"ok": True, "mode": "test", "message": "Test mode — credits already added"}
 
@@ -732,6 +939,135 @@ def confirm_topup(data: TopupConfirmRequest, session: Session = Depends(db)):
         }
     except stripe.error.StripeError as e:
         raise HTTPException(400, str(e))
+
+
+# ── Stripe Webhook ────────────────────────────────────────────────────────────
+
+from fastapi import Request
+
+
+@app.post("/webhooks/stripe")
+async def stripe_webhook(request: Request, session: Session = Depends(db)):
+    """
+    Stripe webhook handler with signature verification and DLQ.
+    Only checkout.session.completed events are processed.
+    """
+    if not settings.STRIPE_SECRET_KEY:
+        raise HTTPException(503, {"error": "stripe_not_configured"})
+
+    import stripe
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    if not settings.STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(503, {"error": "webhook_secret_not_configured"})
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, settings.STRIPE_WEBHOOK_SECRET)
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(400, {"error": "invalid_signature"})
+    except ValueError:
+        raise HTTPException(400, {"error": "invalid_payload"})
+
+    event_type = event.get("type", "")
+    stripe_event_id = event.get("id", "")
+
+    # Process — store failed events in DLQ
+    try:
+        if event_type == "checkout.session.completed":
+            session_data = event["data"]["object"]
+            metadata = session_data.get("metadata", {})
+            agent_id = metadata.get("agent_id", "")
+            amount_cents = session_data.get("amount_total", 0)
+
+            if agent_id:
+                ensure_balance(session, agent_id)
+                bal = session.query(AgentBalance).filter_by(agent_id=agent_id).first()
+                if bal:
+                    bal.balance_cents += amount_cents
+                    session.add(Transaction(
+                        agent_id=agent_id,
+                        tx_type="stripe_topup",
+                        amount_cents=amount_cents,
+                        description=f"Stripe topup: {stripe_event_id}"
+                    ))
+                    session.commit()
+                    print(f"[STRIPE] Topup confirmed: agent={agent_id}, amount={amount_cents}¢")
+        # Return 200 to acknowledge receipt
+        return {"received": True}
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[STRIPE] Webhook processing failed: {error_msg}")
+        # Store in DLQ
+        try:
+            dlq_record = WebhookDLQ(
+                stripe_event_id=stripe_event_id,
+                event_type=event_type,
+                payload=json.dumps(event),
+                error_message=error_msg,
+                status="pending",
+                retry_count=0
+            )
+            session.add(dlq_record)
+            session.commit()
+        except Exception:
+            session.rollback()
+        return {"received": True}
+
+
+@app.post("/admin/dlq/retry")
+def admin_retry_dlq(
+    session: Session = Depends(db),
+    x_admin_key: str = Header(None, alias="X-Admin-Key")
+):
+    """Retry pending DLQ events. Admin only."""
+    if not settings.ADMIN_API_KEY or x_admin_key != settings.ADMIN_API_KEY:
+        raise HTTPException(401, {"error": "unauthorized"})
+
+    import stripe as stripe_lib
+    stripe_lib.api_key = settings.STRIPE_SECRET_KEY
+
+    pending = session.query(WebhookDLQ).filter(
+        WebhookDLQ.status == "pending",
+        WebhookDLQ.retry_count < 5
+    ).limit(50).all()
+
+    processed = 0
+    failed = 0
+    for dlq in pending:
+        try:
+            event = json.loads(dlq.payload)
+            # Re-process the event
+            if dlq.event_type == "checkout.session.completed":
+                session_data = event["data"]["object"]
+                metadata = session_data.get("metadata", {})
+                agent_id = metadata.get("agent_id", "")
+                amount_cents = session_data.get("amount_total", 0)
+                if agent_id:
+                    bal = session.query(AgentBalance).filter_by(agent_id=agent_id).first()
+                    if bal:
+                        bal.balance_cents += amount_cents
+                        session.add(Transaction(
+                            agent_id=agent_id, tx_type="stripe_topup",
+                            amount_cents=amount_cents,
+                            description=f"Stripe topup (DLQ retry): {dlq.stripe_event_id}"
+                        ))
+            dlq.status = "resolved"
+            dlq.resolved_at = datetime.now(timezone.utc)
+            session.commit()
+            processed += 1
+        except Exception as e:
+            dlq.retry_count += 1
+            dlq.last_retry_at = datetime.now(timezone.utc)
+            dlq.error_message = str(e)
+            if dlq.retry_count >= 5:
+                dlq.status = "failed"
+            session.commit()
+            failed += 1
+
+    return {"processed": processed, "failed": failed, "remaining": len(pending) - processed}
 
 
 # ── Stats ────────────────────────────────────────────────────────────────────
