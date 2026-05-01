@@ -1,8 +1,12 @@
-# DenialNet™ — Federated Claim Intelligence Protocol
+# DenialNet
 
-> **"Every denied claim is a pattern. Every pattern, a fix. Every fix, revenue."**
+Intelligence infrastructure for revenue-critical claim workflows.
 
----
+DenialNet turns repeated denial behavior into structured operational knowledge so teams can resolve faster, recover more, and stop relearning the same patterns.
+
+## Standard
+Patterns, not anecdotes.
+Recovery, not noise.
 
 ## What It Is
 
