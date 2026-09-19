@@ -11,7 +11,7 @@ Reviewed published PR #12 head `10d0fef35fb8cf1d756ea5d49288cedd47253802` and pr
 
 ## Evidence
 
-Local `.venv/bin/python -m pytest -q`: **18 passed**, with three dependency deprecation warnings. Tests use temporary SQLite databases, synthetic accounts and mocked Stripe API responses. They include duplicate/concurrent payment receipt settlement, account isolation and failed-credit rollback. These results do not establish PostgreSQL concurrency behavior or live Stripe settlement.
+Local `.venv/bin/python -m pytest -q`: **20 passed**, with three dependency deprecation warnings. Local tests use temporary SQLite databases, synthetic accounts and mocked Stripe API responses. A new PostgreSQL 16 service-container workflow runs this suite in isolated schemas. Initial PostgreSQL runs passed at `ea763b4898a94b9696172be7dcdf05ac0d38872f`; the accompanying follow-up adds schema-aware readiness. This is real database evidence with synthetic payment inputs, not live Stripe settlement.
 
 ## Staging gate remains open
 
@@ -19,6 +19,8 @@ No dedicated staging URL, PostgreSQL service or Stripe test credentials were ava
 
 Before release: deploy the exact candidate to isolated staging; rehearse existing-schema migration and rollback against a representative sanitized PostgreSQL copy; run concurrent purchase/top-up settlement there; create and confirm a real Stripe test-mode payment; replay signed delivery and verify exactly one durable credit after restart; verify readiness, authentication and ledger reconciliation over HTTP. Capture candidate SHA and provider event IDs without secrets.
 
-Production configuration currently requires live Stripe credentials. Staging must have a deliberately separate configuration using test credentials, with mock payments disabled; do not use live keys merely to satisfy configuration validation. Multi-worker rate-limit behavior and contributor reward concurrency also need staging coverage.
+`DENIALNET_ENV=staging` now requires PostgreSQL, `sk_test_` credentials, webhook/admin secrets and disabled mock payments. Production still requires live credentials. Contributor rewards now increment balances atomically. Readiness checks all model tables/columns and rejects missing schema without exposing database error details. Multi-worker rate-limit behavior and deployed recovery still need staging coverage.
+
+Infrastructure discovery: no Render/Stripe/database configuration variables were present. The repository's candidate `https://denialnet.onrender.com/ready` returned HTTP 404. A new Neon connection was confirmed by the application; no Neon database has been provisioned or tested by this review.
 
 Passing local tests or CI alone does not close this gate.

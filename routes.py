@@ -478,7 +478,7 @@ def health():
 
 
 @app.get("/ready")
-def ready(session: Session = Depends(get_session)):
+def ready(session: Session = Depends(db)):
     """
     Readiness probe. Returns 200 only when all dependencies are connected.
     - Database: can execute a test query
@@ -490,11 +490,14 @@ def ready(session: Session = Depends(get_session)):
 
     # DB check
     try:
-        session.execute(text("SELECT 1"))
-        session.commit()
+        from models import Base
+        for table in Base.metadata.sorted_tables:
+            session.execute(table.select().limit(0))
+        session.rollback()
         checks["db"] = "ok"
     except Exception as e:
-        checks["db"] = f"error: {e}"
+        session.rollback()
+        checks["db"] = "unavailable_or_incompatible_schema"
         unhealthy.append("db")
 
     # Redis check (optional dependency — Redis is not required)

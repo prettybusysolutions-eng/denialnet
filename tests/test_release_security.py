@@ -61,6 +61,17 @@ def headers(name='alice'):
     return {'X-API-Key': name}
 
 
+def test_readiness_rejects_missing_payment_schema(system):
+    client, factory, _ = system
+    assert client.get('/ready').status_code == 200
+    with factory() as session:
+        session.execute(text('DROP TABLE payment_receipts'))
+        session.commit()
+    response = client.get('/ready')
+    assert response.status_code == 503
+    assert 'unavailable_or_incompatible_schema' in response.text
+
+
 def test_staging_requires_test_credentials_and_real_database():
     values = dict(ENV='staging', DATABASE_URL='postgresql://localhost/release_test',
                   STRIPE_SECRET_KEY='sk_test_fixture', STRIPE_WEBHOOK_SECRET='whsec_fixture',
