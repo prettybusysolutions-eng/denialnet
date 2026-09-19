@@ -46,6 +46,42 @@ def headers(name='alice'):
     return {'X-API-Key': name}
 
 
+def test_failed_contributor_credit_rolls_back_entire_purchase(system, monkeypatch):
+    _, factory, _ = system
+    from models import PatternEntitlement
+    with factory() as s:
+        s.query(AgentBalance).filter_by(agent_id='bob').delete()
+        s.commit()
+    with factory() as s:
+        original = s.execute
+        def execute(statement, *args, **kwargs):
+            if getattr(statement, 'is_update', False) and 'balance_cents +' in str(statement):
+                raise RuntimeError('simulated contributor credit failure')
+            return original(statement, *args, **kwargs)
+        monkeypatch.setattr(s, 'execute', execute)
+        with pytest.raises(RuntimeError, match='contributor credit failure'):
+            routes.search_patterns(routes.PatternSearchQuery(carrier='Test', cpt_code='D1', agent_id='alice'), s, 'alice')
+        s.rollback()
+    with factory() as s:
+        assert s.get(AgentBalance, 'alice').balance_cents == 500
+        assert s.query(PatternEntitlement).count() == 0
+        assert s.query(Transaction).count() == 0
+
+
+def test_low_quality_patterns_are_not_sold(system):
+    client, factory, _ = system
+    with factory() as s:
+        for pattern in s.query(Pattern).all():
+            pattern.sample_size = 1
+            pattern.success_rate = 0.1
+        s.commit()
+    response = client.post('/patterns/search', headers=headers(), json={
+        'carrier': 'Test', 'cpt_code': 'D1', 'agent_id': 'alice'})
+    assert response.status_code == 200
+    assert response.json()['patterns'] == []
+    assert response.json()['cost_cents'] == 0
+
+
 def intent():
     return {'id': 'pi_test', 'status': 'succeeded', 'currency': 'usd', 'amount': 500,
             'amount_received': 500, 'metadata': {'agent_id': 'alice', 'type': 'denialnet_topup'}}

@@ -323,7 +323,7 @@ def ensure_balance(session: Session, agent_id: str) -> AgentBalance:
     if not bal:
         bal = AgentBalance(agent_id=agent_id, balance_cents=0)
         session.add(bal)
-        session.commit()
+        session.flush()
     return bal
 
 
@@ -669,6 +669,8 @@ def search_patterns(data: PatternSearchQuery, session: Session = Depends(db), x_
             "message": f"Insufficient credits. Need {cost}¢, have {bal.balance_cents}¢. Top up at POST /credits/topup."
         })
 
+    # Apply quality rules before selecting paid results.
+    deactivated = _enforce_min_sample(session)
     # Build and execute query
     q = session.query(Pattern).filter(
         Pattern.is_active == True,
@@ -691,9 +693,6 @@ def search_patterns(data: PatternSearchQuery, session: Session = Depends(db), x_
             "balance_remaining_cents": bal.balance_cents,
             "message": "No patterns yet. Submit what fixed this denial — earn $0.25 every time another agent queries it."
         }
-
-    # Enforce min-sample quality check before returning
-    deactivated = _enforce_min_sample(session)
 
     # Deduct cost from buyer
     debited = session.execute(update(AgentBalance).where(
