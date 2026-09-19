@@ -24,15 +24,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def production_settings(self):
-        if self.ENV not in {"development", "test", "production"}:
-            raise ValueError("DENIALNET_ENV must be development, test, or production")
+        if self.ENV not in {"development", "test", "staging", "production"}:
+            raise ValueError("DENIALNET_ENV must be development, test, staging, or production")
         if self.ALLOW_MOCK_PAYMENTS and self.ENV != "test":
             raise ValueError("Mock payments require DENIALNET_ENV=test")
-        if self.ENV == "production":
+        if self.ENV in {"staging", "production"}:
             if not self.DATABASE_URL or not self.DATABASE_URL.startswith(("postgresql://", "postgresql+psycopg2://")):
                 raise ValueError("Production requires DENIALNET_DATABASE_URL with PostgreSQL")
-            if not self.STRIPE_SECRET_KEY or not self.STRIPE_SECRET_KEY.startswith("sk_live_"):
-                raise ValueError("Production requires a live DENIALNET_STRIPE_SECRET_KEY")
+            prefix = "sk_live_" if self.ENV == "production" else "sk_test_"
+            if not self.STRIPE_SECRET_KEY or not self.STRIPE_SECRET_KEY.startswith(prefix):
+                raise ValueError(f"{self.ENV} requires a {prefix} DENIALNET_STRIPE_SECRET_KEY")
             if not self.STRIPE_WEBHOOK_SECRET or not self.ADMIN_API_KEY:
                 raise ValueError("Production requires webhook and admin credentials")
         return self

@@ -620,7 +620,8 @@ def submit_pattern(data: PatternSubmit, session: Session = Depends(db), x_api_ke
     ensure_balance(session, data.contributor_id)
     bal = session.query(AgentBalance).filter_by(agent_id=data.contributor_id).first()
     bonus = 25  # $0.25 per submission
-    bal.balance_cents += bonus
+    session.execute(update(AgentBalance).where(AgentBalance.agent_id == data.contributor_id).values(
+        balance_cents=AgentBalance.balance_cents + bonus))
 
     session.add(Transaction(
         agent_id=data.contributor_id,
@@ -953,7 +954,8 @@ def ingest_patterns_csv(data: CSVIngestRequest, session: Session = Depends(db), 
             # Credit contributor per pattern (capped at batch bonus)
             ensure_balance(session, data.contributor_id)
             bal = session.query(AgentBalance).filter_by(agent_id=data.contributor_id).first()
-            bal.balance_cents += 25  # $0.25 per pattern
+            session.execute(update(AgentBalance).where(AgentBalance.agent_id == data.contributor_id).values(
+                balance_cents=AgentBalance.balance_cents + 25))
 
             accepted.append({
                 "row": row_num,

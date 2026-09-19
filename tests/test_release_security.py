@@ -1,10 +1,12 @@
 import copy
+import os
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select, func
+from sqlalchemy import create_engine, select, func, text
 from sqlalchemy.orm import sessionmaker
 
 import routes
@@ -15,7 +17,16 @@ from payments import settle_intent
 
 @pytest.fixture
 def system(tmp_path, monkeypatch):
-    engine = create_engine(f'sqlite:///{tmp_path}/test.db', connect_args={'check_same_thread': False, 'timeout': 30})
+    postgres = os.environ.get('RELEASE_TEST_POSTGRES_URL')
+    admin = None
+    if postgres:
+        schema = 'release_' + uuid.uuid4().hex
+        admin = create_engine(postgres, isolation_level='AUTOCOMMIT')
+        with admin.connect() as conn:
+            conn.execute(text(f'CREATE SCHEMA {schema}'))
+        engine = create_engine(postgres, connect_args={'options': f'-csearch_path={schema}'})
+    else:
+        engine = create_engine(f'sqlite:///{tmp_path}/test.db', connect_args={'check_same_thread': False, 'timeout': 30})
     Base.metadata.create_all(engine)
     factory = sessionmaker(engine)
     with factory() as s:
@@ -40,10 +51,25 @@ def system(tmp_path, monkeypatch):
     yield client, factory, ids
     routes.app.dependency_overrides.clear()
     engine.dispose()
+    if admin is not None:
+        with admin.connect() as conn:
+            conn.execute(text(f'DROP SCHEMA {schema} CASCADE'))
+        admin.dispose()
 
 
 def headers(name='alice'):
     return {'X-API-Key': name}
+
+
+def test_staging_requires_test_credentials_and_real_database():
+    values = dict(ENV='staging', DATABASE_URL='postgresql://localhost/release_test',
+                  STRIPE_SECRET_KEY='sk_test_fixture', STRIPE_WEBHOOK_SECRET='whsec_fixture',
+                  ADMIN_API_KEY='local-fixture', ALLOW_MOCK_PAYMENTS=False)
+    assert Settings(**values).ENV == 'staging'
+    for change in ({'STRIPE_SECRET_KEY': 'sk_live_fixture'}, {'ALLOW_MOCK_PAYMENTS': True},
+                   {'DATABASE_URL': 'sqlite:///test.db'}):
+        with pytest.raises(ValueError):
+            Settings(**(values | change))
 
 
 def test_failed_contributor_credit_rolls_back_entire_purchase(system, monkeypatch):
