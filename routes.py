@@ -12,9 +12,10 @@ from decimal import Decimal
 from fastapi import FastAPI, HTTPException, Depends, Query, Request, Header, Body
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, desc, func, text
+from sqlalchemy import and_, desc, func, text, update
+from sqlalchemy.exc import IntegrityError
 from database import get_session, init_db, get_engine
-from models import Pattern, PatternOutcome, AgentBalance, Transaction, StripeCustomer, RateLimit, APIKey, WebhookDLQ
+from models import Pattern, PatternOutcome, AgentBalance, Transaction, StripeCustomer, RateLimit, APIKey, WebhookDLQ, PatternEntitlement, TopupIntent, PaymentReceipt
 from config import settings
 import json
 from contextlib import asynccontextmanager
@@ -71,6 +72,22 @@ def _verify_api_key(session: Session, provided_key: str):
     return key_record
 
 
+def _require_agent(session, key, claimed_agent=None):
+    record = _verify_api_key(session, key)
+    if not record.agent_id:
+        raise HTTPException(403, "API key has no account binding; reissue through admin")
+    if claimed_agent is not None and record.agent_id != claimed_agent:
+        raise HTTPException(403, "Account does not match API key")
+    return record.agent_id
+
+
+def _require_entitlement(session, agent_id, pattern):
+    if pattern.contributor_id != agent_id and session.get(
+        PatternEntitlement, (agent_id, pattern.id)
+    ) is None:
+        raise HTTPException(403, "Pattern must be unlocked by this account")
+
+
 def require_api_key(x_api_key: str = Header(None, alias="X-API-Key")):
     """Dependency: requires a valid API key."""
     def dep(session: Session = Depends(get_session)):
@@ -91,7 +108,7 @@ require_auth = APIKeyAuth()
 
 class CreateAPIKeyRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
-    agent_id: str = Field(None, max_length=100)
+    agent_id: str = Field(..., min_length=1, max_length=100)
     rate_limit_override: int = Field(None, ge=10, le=10000)
 
 
@@ -363,7 +380,7 @@ def _enforce_min_sample(session: Session):
 
 class CreateAPIKeyRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
-    agent_id: str = Field(None, max_length=100)
+    agent_id: str = Field(..., min_length=1, max_length=100)
     rate_limit_override: int = Field(None, ge=10, le=10000)
 
 
@@ -558,7 +575,7 @@ def preview_patterns(
                 "success_rate": round(p.success_rate, 3),
                 "sample_size": p.sample_size,
                 "match_level": _match_level(p, carrier, cpt_code, icd10_code),
-                "resolution_preview": " • ".join(p.resolution_steps[:2]) + (" ..." if len(p.resolution_steps) > 2 else ""),
+                "resolution_preview": "Unlock required",
             }
             for p in results
         ],
@@ -574,7 +591,7 @@ def preview_patterns(
 @app.post("/patterns")
 def submit_pattern(data: PatternSubmit, session: Session = Depends(db), x_api_key: str = Header(None)):
     """Submit a new denial resolution pattern. Requires X-API-Key."""
-    _verify_api_key(session, x_api_key)
+    _require_agent(session, x_api_key, data.contributor_id)
     # Enforce minimum quality
     if len(data.resolution_steps) < 1:
         raise HTTPException(400, "At least one resolution step is required")
@@ -634,7 +651,7 @@ def search_patterns(data: PatternSearchQuery, session: Session = Depends(db), x_
     Contributors paid automatically based on split table.
     Requires X-API-Key header.
     """
-    _verify_api_key(session, x_api_key)
+    _require_agent(session, x_api_key, data.agent_id)
     # Check balance
     ensure_balance(session, data.agent_id)
     bal = session.query(AgentBalance).filter_by(agent_id=data.agent_id).first()
@@ -679,7 +696,16 @@ def search_patterns(data: PatternSearchQuery, session: Session = Depends(db), x_
     deactivated = _enforce_min_sample(session)
 
     # Deduct cost from buyer
-    bal.balance_cents -= cost
+    debited = session.execute(update(AgentBalance).where(
+        AgentBalance.agent_id == data.agent_id,
+        AgentBalance.balance_cents >= cost,
+    ).values(balance_cents=AgentBalance.balance_cents - cost))
+    if debited.rowcount != 1:
+        session.rollback()
+        raise HTTPException(402, "Insufficient credits")
+    for pattern in results:
+        if session.get(PatternEntitlement, (data.agent_id, pattern.id)) is None:
+            session.add(PatternEntitlement(agent_id=data.agent_id, pattern_id=pattern.id))
 
     # Log buyer deduction
     session.add(Transaction(
@@ -695,7 +721,7 @@ def search_patterns(data: PatternSearchQuery, session: Session = Depends(db), x_
     contributor_pay = int(cost * settings.CONTRIBUTOR_SPLIT)
     ensure_balance(session, top.contributor_id)
     contrib_bal = session.query(AgentBalance).filter_by(agent_id=top.contributor_id).first()
-    contrib_bal.balance_cents += contributor_pay
+    session.execute(update(AgentBalance).where(AgentBalance.agent_id == top.contributor_id).values(balance_cents=AgentBalance.balance_cents + contributor_pay))
 
     session.add(Transaction(
         agent_id=top.contributor_id,
@@ -736,8 +762,9 @@ def search_patterns(data: PatternSearchQuery, session: Session = Depends(db), x_
 # ── Get specific pattern ──────────────────────────────────────────────────────
 
 @app.get("/patterns/{pattern_id}")
-def get_pattern(pattern_id: str, session: Session = Depends(db)):
+def get_pattern(pattern_id: str, session: Session = Depends(db), x_api_key: str = Header(None)):
     """Get a specific pattern by ID. Requires prior unlock or submission."""
+    agent_id = _require_agent(session, x_api_key)
     try:
         pid = uuid_lib.UUID(pattern_id)
     except ValueError:
@@ -747,6 +774,7 @@ def get_pattern(pattern_id: str, session: Session = Depends(db)):
         raise HTTPException(404, "Pattern not found")
     if not p.is_active:
         raise HTTPException(410, "Pattern has been deactivated due to low success rate")
+    _require_entitlement(session, agent_id, p)
     return _pattern_dict(p, include_resolution=True)
 
 
@@ -758,7 +786,7 @@ def submit_outcome(pattern_id: str, data: OutcomeSubmit, session: Session = Depe
     Log outcome of using a pattern. Updates success_rate using exponential moving average.
     Requires X-API-Key.
     """
-    _verify_api_key(session, x_api_key)
+    _require_agent(session, x_api_key, data.submitted_by)
     try:
         pid = uuid_lib.UUID(pattern_id)
     except ValueError:
@@ -767,6 +795,8 @@ def submit_outcome(pattern_id: str, data: OutcomeSubmit, session: Session = Depe
     p = session.query(Pattern).filter_by(id=pid).first()
     if not p:
         raise HTTPException(404, "Pattern not found")
+
+    _require_entitlement(session, data.submitted_by, p)
 
     # Record outcome
     session.add(PatternOutcome(
@@ -806,8 +836,9 @@ def submit_outcome(pattern_id: str, data: OutcomeSubmit, session: Session = Depe
 # ── Credits ──────────────────────────────────────────────────────────────────
 
 @app.get("/credits/{agent_id}")
-def get_credits(agent_id: str, session: Session = Depends(db)):
+def get_credits(agent_id: str, session: Session = Depends(db), x_api_key: str = Header(None)):
     """Get agent credit balance in cents and USD."""
+    _require_agent(session, x_api_key, agent_id)
     ensure_balance(session, agent_id)
     bal = session.query(AgentBalance).filter_by(agent_id=agent_id).first()
     return {
@@ -822,8 +853,9 @@ def get_credits(agent_id: str, session: Session = Depends(db)):
 @app.get("/credits/{agent_id}/transactions")
 def get_transactions(agent_id: str, limit: int = Query(20, ge=1, le=200),
                      offset: int = Query(0, ge=0),
-                     session: Session = Depends(db)):
+                     session: Session = Depends(db), x_api_key: str = Header(None)):
     """Paginated transaction history for an agent."""
+    _require_agent(session, x_api_key, agent_id)
     txs = session.query(Transaction).filter_by(agent_id=agent_id).order_by(
         desc(Transaction.created_at)
     ).offset(offset).limit(limit).all()
@@ -873,7 +905,7 @@ def ingest_patterns_csv(data: CSVIngestRequest, session: Session = Depends(db), 
     accepted = []
     rejected = []
     required = ["carrier", "cpt_code", "denial_reason", "resolution_steps"]
-    _verify_api_key(session, x_api_key)
+    _require_agent(session, x_api_key, data.contributor_id)
     check_rate_limit(session, data.contributor_id, "submit",
                      settings.RATE_LIMIT_SUBMIT, settings.RATE_LIMIT_WINDOW_MINUTES)
 
@@ -946,235 +978,121 @@ def ingest_patterns_csv(data: CSVIngestRequest, session: Session = Depends(db), 
     }
 
 
-# ── Stripe Topup ─────────────────────────────────────────────────────────────
+# PaymentIntent is the single settlement identity across confirm/webhook/retry.
+from payments import settle_intent
 
-@app.post("/credits/topup")
+
+def _stripe_client():
+    if not settings.STRIPE_SECRET_KEY or settings.STRIPE_SECRET_KEY == 'sk_test_xxx':
+        raise HTTPException(503, 'Stripe is not configured; no credits issued')
+    import stripe
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+    return stripe
+
+
+@app.post('/credits/topup')
 def create_topup_intent(data: StripeTopupRequest, session: Session = Depends(db), x_api_key: str = Header(None)):
-    """
-    Create a Stripe PaymentIntent for credit topup. Requires X-API-Key.
-    """
-    _verify_api_key(session, x_api_key)
-    if not settings.STRIPE_SECRET_KEY or settings.STRIPE_SECRET_KEY.startswith("sk_live_") == False:
-        # Return mock success in dev/test
-        if settings.STRIPE_SECRET_KEY in (None, "", "sk_test_xxx"):
-            ensure_balance(session, data.agent_id)
-            bal = session.query(AgentBalance).filter_by(agent_id=data.agent_id).first()
-            bal.balance_cents += data.amount_cents
-            session.add(Transaction(
-                agent_id=data.agent_id,
-                tx_type="credit_topup",
-                amount_cents=data.amount_cents,
-                description=f"Test topup: {data.amount_cents}¢"
-            ))
-            session.commit()
-            return {
-                "ok": True,
-                "mode": "test",
-                "agent_id": data.agent_id,
-                "amount_cents": data.amount_cents,
-                "amount_usd": round(data.amount_cents / 100, 2),
-                "new_balance_cents": bal.balance_cents,
-                "message": f"Test topup: added {data.amount_cents}¢. Set STRIPE_SECRET_KEY for real payments."
-            }
-        return HTTPException(503, "Stripe not configured")
-
-    import stripe
-    stripe.api_key = settings.STRIPE_SECRET_KEY
-
+    agent = _require_agent(session, x_api_key, data.agent_id)
+    # Explicit test-only mock path; production settings reject this combination.
+    if settings.ENV == 'test' and settings.ALLOW_MOCK_PAYMENTS:
+        ensure_balance(session, agent)
+        session.execute(update(AgentBalance).where(AgentBalance.agent_id == agent).values(
+            balance_cents=AgentBalance.balance_cents + data.amount_cents))
+        session.add(Transaction(agent_id=agent, tx_type='test_credit', amount_cents=data.amount_cents,
+                                description='Explicit synthetic test credit; not revenue'))
+        session.commit()
+        return {'ok': True, 'mode': 'test', 'data_class': 'synthetic'}
+    stripe = _stripe_client()
+    ensure_balance(session, agent)
+    session.commit()
     try:
-        intent = stripe.PaymentIntent.create(
-            amount=data.amount_cents,  # amount in cents
-            currency="usd",
-            payment_method_types=["card"],
-            description=f"DenialNet™ credit topup: {data.agent_id}",
-            metadata={
-                "agent_id": data.agent_id,
-                "type": "denialnet_topup"
-            }
-        )
-        return {
-            "client_secret": intent.client_secret,
-            "payment_intent_id": intent.id,
-            "amount_cents": data.amount_cents,
-            "amount_usd": round(data.amount_cents / 100, 2),
-            "mode": "live"
-        }
-    except stripe.error.StripeError as e:
-        raise HTTPException(400, str(e))
+        intent = stripe.PaymentIntent.create(amount=data.amount_cents, currency='usd',
+            payment_method_types=['card'], metadata={'agent_id': agent, 'type': 'denialnet_topup'})
+        session.add(TopupIntent(payment_intent_id=intent.id, agent_id=agent, amount_cents=data.amount_cents))
+        session.commit()
+        return {'client_secret': intent.client_secret, 'payment_intent_id': intent.id,
+                'amount_cents': data.amount_cents, 'mode': 'live' if intent.livemode else 'test'}
+    except stripe.error.StripeError:
+        session.rollback()
+        raise HTTPException(502, 'Stripe could not create the payment')
 
 
-@app.post("/credits/topup/confirm")
+@app.post('/credits/topup/confirm')
 def confirm_topup(data: TopupConfirmRequest, session: Session = Depends(db), x_api_key: str = Header(None)):
-    """Confirm a Stripe topup after PaymentIntent succeeds. Requires X-API-Key."""
-    _verify_api_key(session, x_api_key)
-    if not settings.STRIPE_SECRET_KEY or settings.STRIPE_SECRET_KEY == "sk_test_xxx":
-        return {"ok": True, "mode": "test", "message": "Test mode — credits already added"}
-
-    import stripe
-    stripe.api_key = settings.STRIPE_SECRET_KEY
-
+    agent = _require_agent(session, x_api_key, data.agent_id)
+    stripe = _stripe_client()
     try:
         intent = stripe.PaymentIntent.retrieve(data.payment_intent_id)
-        if intent.status != "succeeded":
-            raise HTTPException(400, f"Payment not succeeded: {intent.status}")
-
-        # Verify agent_id matches
-        if intent.metadata.get("agent_id") != data.agent_id:
-            raise HTTPException(400, "Agent ID mismatch")
-
-        amount_cents = intent.amount
-
-        ensure_balance(session, data.agent_id)
-        bal = session.query(AgentBalance).filter_by(agent_id=data.agent_id).first()
-        bal.balance_cents += amount_cents
-
-        session.add(Transaction(
-            agent_id=data.agent_id,
-            tx_type="credit_topup",
-            amount_cents=amount_cents,
-            description=f"Stripe topup: {amount_cents}¢ (PI: {intent.id})"
-        ))
-        session.commit()
-
-        return {
-            "ok": True,
-            "payment_intent_id": intent.id,
-            "amount_cents": amount_cents,
-            "amount_usd": round(amount_cents / 100, 2),
-            "new_balance_cents": bal.balance_cents,
-            "new_balance_usd": round(bal.balance_cents / 100, 2),
-        }
-    except stripe.error.StripeError as e:
-        raise HTTPException(400, str(e))
+        return settle_intent(session, intent, agent)
+    except stripe.error.StripeError:
+        raise HTTPException(502, 'Stripe payment verification failed')
 
 
-# ── Stripe Webhook ────────────────────────────────────────────────────────────
+def _process_payment_event(session, event):
+    if event.get('type') != 'payment_intent.succeeded':
+        return {'received': True, 'ignored': True}
+    return settle_intent(session, event['data']['object'])
 
-from fastapi import Request
 
-
-@app.post("/webhooks/stripe")
+@app.post('/webhooks/stripe')
 async def stripe_webhook(request: Request, session: Session = Depends(db)):
-    """
-    Stripe webhook handler with signature verification and DLQ.
-    Only checkout.session.completed events are processed.
-    """
-    if not settings.STRIPE_SECRET_KEY:
-        raise HTTPException(503, {"error": "stripe_not_configured"})
-
-    import stripe
-    stripe.api_key = settings.STRIPE_SECRET_KEY
-
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature", "")
-
+    stripe = _stripe_client()
     if not settings.STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(503, {"error": "webhook_secret_not_configured"})
-
+        raise HTTPException(503, 'Stripe webhook secret is not configured')
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, settings.STRIPE_WEBHOOK_SECRET)
-    except stripe.error.SignatureVerificationError:
-        raise HTTPException(400, {"error": "invalid_signature"})
-    except ValueError:
-        raise HTTPException(400, {"error": "invalid_payload"})
-
-    event_type = event.get("type", "")
-    stripe_event_id = event.get("id", "")
-
-    # Process — store failed events in DLQ
+        event = stripe.Webhook.construct_event(await request.body(),
+            request.headers.get('stripe-signature', ''), settings.STRIPE_WEBHOOK_SECRET)
+    except (stripe.error.SignatureVerificationError, ValueError):
+        raise HTTPException(400, 'Invalid Stripe signature or payload')
     try:
-        if event_type == "checkout.session.completed":
-            session_data = event["data"]["object"]
-            metadata = session_data.get("metadata", {})
-            agent_id = metadata.get("agent_id", "")
-            amount_cents = session_data.get("amount_total", 0)
-
-            if agent_id:
-                ensure_balance(session, agent_id)
-                bal = session.query(AgentBalance).filter_by(agent_id=agent_id).first()
-                if bal:
-                    bal.balance_cents += amount_cents
-                    session.add(Transaction(
-                        agent_id=agent_id,
-                        tx_type="stripe_topup",
-                        amount_cents=amount_cents,
-                        description=f"Stripe topup: {stripe_event_id}"
-                    ))
+        return _process_payment_event(session, event)
+    except Exception:
+        session.rollback()
+        event_id = event.get('id')
+        if event_id:
+            try:
+                if not session.query(WebhookDLQ).filter_by(stripe_event_id=event_id).first():
+                    session.add(WebhookDLQ(stripe_event_id=event_id, event_type=event.get('type', ''),
+                        payload=json.dumps(event), error_message='Settlement failed; provider retry required',
+                        status='pending', retry_count=0))
                     session.commit()
-                    print(f"[STRIPE] Topup confirmed: agent={agent_id}, amount={amount_cents}¢")
-        # Return 200 to acknowledge receipt
-        return {"received": True}
-    except Exception as e:
-        error_msg = str(e)
-        print(f"[STRIPE] Webhook processing failed: {error_msg}")
-        # Store in DLQ
+            except Exception:
+                session.rollback()
+        # Do not acknowledge an uncommitted credit as successfully delivered.
+        raise HTTPException(503, 'Settlement not committed; retry required')
+
+
+@app.post('/admin/dlq/retry')
+def admin_retry_dlq(session: Session = Depends(db), x_admin_key: str = Header(None, alias='X-Admin-Key')):
+    if not settings.ADMIN_API_KEY or not hmac.compare_digest(x_admin_key or '', settings.ADMIN_API_KEY):
+        raise HTTPException(401, 'Unauthorized')
+    stripe = _stripe_client()
+    pending_ids = [r.id for r in session.query(WebhookDLQ).filter(
+        WebhookDLQ.status == 'pending', WebhookDLQ.retry_count < 5).limit(50).all()]
+    processed = failed = 0
+    for record_id in pending_ids:
+        record = session.get(WebhookDLQ, record_id)
         try:
-            dlq_record = WebhookDLQ(
-                stripe_event_id=stripe_event_id,
-                event_type=event_type,
-                payload=json.dumps(event),
-                error_message=error_msg,
-                status="pending",
-                retry_count=0
-            )
-            session.add(dlq_record)
-            session.commit()
-        except Exception:
-            session.rollback()
-        return {"received": True}
-
-
-@app.post("/admin/dlq/retry")
-def admin_retry_dlq(
-    session: Session = Depends(db),
-    x_admin_key: str = Header(None, alias="X-Admin-Key")
-):
-    """Retry pending DLQ events. Admin only."""
-    if not settings.ADMIN_API_KEY or x_admin_key != settings.ADMIN_API_KEY:
-        raise HTTPException(401, {"error": "unauthorized"})
-
-    import stripe as stripe_lib
-    stripe_lib.api_key = settings.STRIPE_SECRET_KEY
-
-    pending = session.query(WebhookDLQ).filter(
-        WebhookDLQ.status == "pending",
-        WebhookDLQ.retry_count < 5
-    ).limit(50).all()
-
-    processed = 0
-    failed = 0
-    for dlq in pending:
-        try:
-            event = json.loads(dlq.payload)
-            # Re-process the event
-            if dlq.event_type == "checkout.session.completed":
-                session_data = event["data"]["object"]
-                metadata = session_data.get("metadata", {})
-                agent_id = metadata.get("agent_id", "")
-                amount_cents = session_data.get("amount_total", 0)
-                if agent_id:
-                    bal = session.query(AgentBalance).filter_by(agent_id=agent_id).first()
-                    if bal:
-                        bal.balance_cents += amount_cents
-                        session.add(Transaction(
-                            agent_id=agent_id, tx_type="stripe_topup",
-                            amount_cents=amount_cents,
-                            description=f"Stripe topup (DLQ retry): {dlq.stripe_event_id}"
-                        ))
-            dlq.status = "resolved"
-            dlq.resolved_at = datetime.now(timezone.utc)
+            # Fetch authenticated provider evidence; never trust editable DLQ payloads.
+            event = stripe.Event.retrieve(record.stripe_event_id)
+            if event.get('type') != 'payment_intent.succeeded':
+                raise ValueError('Legacy event requires manual payment reconciliation')
+            _process_payment_event(session, event)
+            record.status = 'resolved'
+            record.resolved_at = datetime.now(timezone.utc)
             session.commit()
             processed += 1
-        except Exception as e:
-            dlq.retry_count += 1
-            dlq.last_retry_at = datetime.now(timezone.utc)
-            dlq.error_message = str(e)
-            if dlq.retry_count >= 5:
-                dlq.status = "failed"
+        except Exception:
+            session.rollback()
+            record = session.get(WebhookDLQ, record_id)
+            record.retry_count += 1
+            record.last_retry_at = datetime.now(timezone.utc)
+            record.error_message = 'Provider verification or settlement failed'
+            if record.retry_count >= 5:
+                record.status = 'failed'
             session.commit()
             failed += 1
-
-    return {"processed": processed, "failed": failed, "remaining": len(pending) - processed}
+    return {'processed': processed, 'failed': failed}
 
 
 # ── Stats ────────────────────────────────────────────────────────────────────
