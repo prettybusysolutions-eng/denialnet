@@ -2,7 +2,7 @@
 
 Status: release gate OPEN. This is an author-side engineering review, not independent third-party certification or proof of a production release.
 
-Reviewed published PR #12 head `10d0fef35fb8cf1d756ea5d49288cedd47253802` and prepared the accompanying follow-up changes.
+Reviewed published PR #12 final candidate head `6907b1911644f8487196cc768cb5471b343a0763`.
 
 ## Findings corrected
 
@@ -11,7 +11,7 @@ Reviewed published PR #12 head `10d0fef35fb8cf1d756ea5d49288cedd47253802` and pr
 
 ## Evidence
 
-Local `.venv/bin/python -m pytest -q`: **20 passed**, with three dependency deprecation warnings. Local tests use temporary SQLite databases, synthetic accounts and mocked Stripe API responses. A new PostgreSQL 16 service-container workflow runs this suite in isolated schemas. Initial PostgreSQL runs passed at `ea763b4898a94b9696172be7dcdf05ac0d38872f`; the accompanying follow-up adds schema-aware readiness. This is real database evidence with synthetic payment inputs, not live Stripe settlement.
+Local `.venv/bin/python -m pytest -q`: **21 passed, 1 skipped**, with three dependency deprecation warnings. GitHub's PostgreSQL 16 plus Redis service-container workflow passed, including isolated schemas and shared-worker rate-limit checks. Stripe inputs remain synthetic; no live Stripe settlement was performed.
 
 ## Staging gate remains open
 
