@@ -2,7 +2,7 @@
 
 Status: release gate OPEN. This is an author-side engineering review, not independent third-party certification or proof of a production release.
 
-Reviewed published PR #12 final candidate head `6907b1911644f8487196cc768cb5471b343a0763`.
+Reviewed published PR #12 final candidate head `b6ef91706365e598bee935e4d891a6f8e45877f9`.
 
 ## Findings corrected
 
@@ -21,6 +21,6 @@ Before release: deploy the exact candidate to isolated staging; rehearse existin
 
 `DENIALNET_ENV=staging` now requires PostgreSQL, `sk_test_` credentials, webhook/admin secrets and disabled mock payments. Production still requires live credentials. Contributor rewards now increment balances atomically. Readiness checks all model tables/columns and rejects missing schema without exposing database error details. Multi-worker rate-limit behavior and deployed recovery still need staging coverage.
 
-Infrastructure discovery: no Render/Stripe/database configuration variables were present. The repository's candidate `https://denialnet.onrender.com/ready` returned HTTP 404. A new Neon connection was confirmed by the application; no Neon database has been provisioned or tested by this review.
+Infrastructure discovery: no Render/Stripe configuration variables were present. The repository's candidate `https://denialnet.onrender.com/ready` returned HTTP 404. An isolated Neon project `prettybusy-release-staging` was provisioned with a `denialnet-staging` branch. Direct connections from this sandbox were blocked by its network allowlist, and the final Neon SQL review was rejected by the platform usage limit, so database contents were not claimed as verified.
 
 Passing local tests or CI alone does not close this gate.
