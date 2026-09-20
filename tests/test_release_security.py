@@ -74,6 +74,7 @@ def test_readiness_rejects_missing_payment_schema(system):
 
 def test_staging_requires_test_credentials_and_real_database():
     values = dict(ENV='staging', DATABASE_URL='postgresql://localhost/release_test',
+                  REDIS_URL='redis://localhost:6379/0',
                   STRIPE_SECRET_KEY='sk_test_fixture', STRIPE_WEBHOOK_SECRET='whsec_fixture',
                   ADMIN_API_KEY='local-fixture', ALLOW_MOCK_PAYMENTS=False)
     assert Settings(**values).ENV == 'staging'

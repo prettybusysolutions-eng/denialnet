@@ -29,6 +29,8 @@ class Settings(BaseSettings):
         if self.ALLOW_MOCK_PAYMENTS and self.ENV != "test":
             raise ValueError("Mock payments require DENIALNET_ENV=test")
         if self.ENV in {"staging", "production"}:
+            if not self.REDIS_URL or not self.REDIS_URL.startswith(('redis://', 'rediss://')):
+                raise ValueError('Staging and production require DENIALNET_REDIS_URL')
             if not self.DATABASE_URL or not self.DATABASE_URL.startswith(("postgresql://", "postgresql+psycopg2://")):
                 raise ValueError("Production requires DENIALNET_DATABASE_URL with PostgreSQL")
             prefix = "sk_live_" if self.ENV == "production" else "sk_test_"

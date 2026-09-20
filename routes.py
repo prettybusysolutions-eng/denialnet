@@ -139,41 +139,44 @@ def _get_redis_client():
     if _redis_client is None and settings.REDIS_URL:
         try:
             import redis
-            _redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+            _redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True,
+                                           socket_connect_timeout=3, socket_timeout=3)
             _redis_client.ping()
             print("[RATE] Redis connected for rate limiting")
         except Exception as e:
-            print(f"[RATE] Redis unavailable, using in-memory fallback: {e}")
             _redis_client = None
+            raise HTTPException(503, 'Rate limit storage unavailable') from e
     return _redis_client
 
 
 def check_rate_limit(session: Session, agent_id: str, endpoint: str, limit: int, window_minutes: int):
-    """Check and enforce rate limit. Uses Redis if available, falls back to in-memory DB."""
+    """Shared fixed windows in deployed environments; DB fallback for local development."""
     redis_client = _get_redis_client()
 
     if redis_client:
         # Redis-backed rate limiting
-        window_key = datetime.now(timezone.utc).strftime("%Y%m%d%H")
-        key = f"rl:{agent_id}:{endpoint}:{window_key}"
+        window_seconds = window_minutes * 60
+        window_key = int(datetime.now(timezone.utc).timestamp()) // window_seconds
+        key = f"denialnet:rl:{agent_id}:{endpoint}:{window_key}"
         try:
-            current = redis_client.incr(key)
-            if current == 1:
-                redis_client.expire(key, window_minutes * 60)
+            current = redis_client.eval('''
+                local n = redis.call('INCR', KEYS[1])
+                if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+                return n
+            ''', 1, key, window_seconds)
             if current > limit:
-                window_start = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+                reset_at = datetime.fromtimestamp((window_key + 1) * window_seconds, timezone.utc)
                 raise HTTPException(429, {
                     "error": "rate_limit_exceeded",
                     "endpoint": endpoint,
                     "limit": limit,
                     "window_minutes": window_minutes,
-                    "reset_at": window_start.isoformat()
+                    "reset_at": reset_at.isoformat()
                 })
         except HTTPException:
             raise
         except Exception as e:
-            print(f"[RATE] Redis error: {e} — falling back to DB")
-            _redis_client = None  # Force fallback on next call
+            raise HTTPException(503, 'Rate limit storage unavailable') from e
 
     if not redis_client:
         # In-memory DB fallback
@@ -509,7 +512,7 @@ def ready(session: Session = Depends(db)):
         else:
             checks["redis"] = "not_configured"
     except Exception as e:
-        checks["redis"] = f"error: {e}"
+        checks["redis"] = "unavailable"
         unhealthy.append("redis")
 
     if unhealthy:
