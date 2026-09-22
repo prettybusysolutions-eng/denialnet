@@ -4,6 +4,10 @@ Intelligence infrastructure for revenue-critical claim workflows.
 
 DenialNet turns repeated denial behavior into structured operational knowledge so teams can resolve faster, recover more, and stop relearning the same patterns.
 
+**Start here:** [run the local SQLite quickstart](QUICKSTART.md).
+
+Release status and gates: [RELEASING.md](RELEASING.md).
+
 ## Standard
 Patterns, not anecdotes.
 Recovery, not noise.
