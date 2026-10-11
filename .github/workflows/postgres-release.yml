@@ -1,0 +1,31 @@
+name: PostgreSQL release checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  postgres-release:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: release-test-only
+          POSTGRES_DB: release_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      RELEASE_TEST_REDIS_URL: redis://localhost:6379/0
+      RELEASE_TEST_POSTGRES_URL: postgresql://postgres:release-test-only@localhost:5432/release_test
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt pytest httpx
+      - run: python -m pytest tests/test_release_security.py tests/test_redis_release.py -q
