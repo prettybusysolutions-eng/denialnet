@@ -120,3 +120,27 @@ class WebhookDLQ(Base):
     created_at = Column(SAType(timezone=True), server_default=func.now())
     last_retry_at = Column(SAType(timezone=True), nullable=True)
     resolved_at = Column(SAType(timezone=True), nullable=True)
+
+
+class PatternEntitlement(Base):
+    """Durable access to each pattern actually returned by a paid search."""
+    __tablename__ = "pattern_entitlements"
+    agent_id = Column(String(100), primary_key=True)
+    pattern_id = Column(UUID(as_uuid=True), ForeignKey("patterns.id"), primary_key=True)
+
+
+class TopupIntent(Base):
+    """Server-created payment binding; no caller-selected account on settlement."""
+    __tablename__ = "topup_intents"
+    payment_intent_id = Column(String(100), primary_key=True)
+    agent_id = Column(String(100), nullable=False)
+    amount_cents = Column(Integer, nullable=False)
+
+
+class PaymentReceipt(Base):
+    """One credit operation per PaymentIntent across confirmations and webhooks."""
+    __tablename__ = "payment_receipts"
+    payment_intent_id = Column(String(100), primary_key=True)
+    agent_id = Column(String(100), nullable=False)
+    amount_cents = Column(Integer, nullable=False)
+    created_at = Column(SAType(timezone=True), server_default=func.now())

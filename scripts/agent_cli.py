@@ -16,6 +16,7 @@ import sys
 import os
 
 DENIALNET_URL = os.environ.get("DENIALNET_URL", "http://localhost:8001")
+API_KEY = os.environ.get("DENIALNET_API_KEY", "")
 AGENT_ID = os.environ.get("DENIALNET_AGENT_ID", "agent-cli")
 
 
@@ -51,7 +52,7 @@ def search(carrier, cpt_code, icd10=None, denial_reason=None, specialty=None, ag
     req = urllib.request.Request(
         f"{DENIALNET_URL}/patterns/search",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "X-API-Key": API_KEY},
         method="POST"
     )
     try:
@@ -71,7 +72,7 @@ def get_outcome(pattern_id, outcome, submitted_by=AGENT_ID, notes=None):
     req = urllib.request.Request(
         f"{DENIALNET_URL}/patterns/{pattern_id}/outcome",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "X-API-Key": API_KEY},
         method="POST"
     )
     try:
@@ -84,7 +85,7 @@ def get_outcome(pattern_id, outcome, submitted_by=AGENT_ID, notes=None):
 def get_balance(agent_id=AGENT_ID):
     import urllib.request
     try:
-        with urllib.request.urlopen(f"{DENIALNET_URL}/credits/{agent_id}") as r:
+        with urllib.request.urlopen(urllib.request.Request(f"{DENIALNET_URL}/credits/{agent_id}", headers={"X-API-Key": API_KEY})) as r:
             return json.loads(r.read())
     except Exception as e:
         return {"error": str(e)}
@@ -164,7 +165,7 @@ def main():
             sys.exit(1)
         pid = result["patterns"][0]["pattern_id"]
         print(f"\n[Step 3] Logging outcome: {args.approve}")
-        oc = get_outcome(pid, args.approve)
+        oc = get_outcome(pid, args.approve, args.agent_id)
         if "error" in oc:
             print(f"  ✗ {oc['error']}")
             sys.exit(1)
